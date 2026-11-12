@@ -1,12 +1,15 @@
 import * as React from 'react'
 
-import { Octicon, OcticonSymbol } from '../octicons'
+import { Octicon } from '../octicons'
+import * as octicons from '../octicons/octicons.generated'
 import { HighlightText } from '../lib/highlight-text'
 import { Branch, IAheadBehind } from '../../models/branch'
 import { IMatches } from '../../lib/fuzzy-find'
 import { AheadBehindStore } from '../../lib/stores/ahead-behind-store'
 import { Repository } from '../../models/repository'
-import { IDisposable } from 'event-kit'
+import type { Disposable } from 'event-kit'
+import { TooltippedContent } from '../lib/tooltipped-content'
+import { formatNumber } from '../../lib/format-number'
 
 interface ICompareBranchListItemProps {
   readonly branch: Branch
@@ -49,7 +52,7 @@ export class CompareBranchListItem extends React.Component<
     return { aheadBehind, comparisonFrom: from, comparisonTo: to }
   }
 
-  private aheadBehindSubscription: IDisposable | null = null
+  private aheadBehindSubscription: Disposable | null = null
 
   public constructor(props: ICompareBranchListItemProps) {
     super(props)
@@ -106,18 +109,18 @@ export class CompareBranchListItem extends React.Component<
     const { currentBranch, branch } = this.props
     const { aheadBehind } = this.state
     const isCurrentBranch = branch.name === currentBranch?.name
-    const icon = isCurrentBranch ? OcticonSymbol.check : OcticonSymbol.gitBranch
+    const icon = isCurrentBranch ? octicons.check : octicons.gitBranch
 
     const aheadBehindElement = aheadBehind ? (
       <div className="branch-commit-counter">
         <span className="branch-commit-counter-item">
-          {aheadBehind.behind}
-          <Octicon className="icon" symbol={OcticonSymbol.arrowDown} />
+          {formatNumber(aheadBehind.behind)}
+          <Octicon className="icon" symbol={octicons.arrowDown} />
         </span>
 
         <span className="branch-commit-counter-item">
-          {aheadBehind.ahead}
-          <Octicon className="icon" symbol={OcticonSymbol.arrowUp} />
+          {formatNumber(aheadBehind.ahead)}
+          <Octicon className="icon" symbol={octicons.arrowUp} />
         </span>
       </div>
     ) : null
@@ -125,12 +128,17 @@ export class CompareBranchListItem extends React.Component<
     return (
       <div className="branches-list-item">
         <Octicon className="icon" symbol={icon} />
-        <div className="name" title={branch.name}>
+        <TooltippedContent
+          className="name"
+          tooltip={branch.name}
+          onlyWhenOverflowed={true}
+          tagName="div"
+        >
           <HighlightText
             text={branch.name}
             highlight={this.props.matches.title}
           />
-        </div>
+        </TooltippedContent>
         {aheadBehindElement}
       </div>
     )

@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { ChangedFileDetails } from './changed-file-details'
+import { DiffHeader } from '../diff/diff-header'
 import {
   DiffSelection,
   IDiff,
@@ -9,7 +9,6 @@ import {
 import { WorkingDirectoryFileChange } from '../../models/status'
 import { Repository } from '../../models/repository'
 import { Dispatcher } from '../dispatcher'
-import { enableHideWhitespaceInDiffOption } from '../../lib/feature-flag'
 import { SeamlessDiffSwitcher } from '../diff/seamless-diff-switcher'
 import { PopupType } from '../../models/popup'
 
@@ -30,6 +29,9 @@ interface IChangesProps {
    */
   readonly onOpenBinaryFile: (fullPath: string) => void
 
+  /** Called when the user requests to open a submodule. */
+  readonly onOpenSubmodule: (fullPath: string) => void
+
   /**
    * Called when the user is viewing an image diff and requests
    * to change the diff presentation mode.
@@ -47,24 +49,38 @@ interface IChangesProps {
    */
   readonly showSideBySideDiff: boolean
 
+  /** Whether or not to show the diff check marks indicating inclusion in a commit */
+  readonly showDiffCheckMarks: boolean
+
   /** Called when the user opens the diff options popover */
   readonly onDiffOptionsOpened: () => void
 }
 
 export class Changes extends React.Component<IChangesProps, {}> {
-  private onDiffLineIncludeChanged = (diffSelection: DiffSelection) => {
-    const file = this.props.file
-    this.props.dispatcher.changeFileLineSelection(
-      this.props.repository,
-      file,
-      diffSelection
-    )
+  /**
+   * Whether or not it's currently possible to change the line selection
+   * of a diff. Changing selection is not possible while a commit is in
+   * progress or if the user has opted to hide whitespace changes.
+   */
+  private get lineSelectionDisabled() {
+    return this.props.isCommitting || this.props.hideWhitespaceInDiff
+  }
+
+  private onDiffLineIncludeChanged = (selection: DiffSelection) => {
+    if (!this.lineSelectionDisabled) {
+      const { repository, file } = this.props
+      this.props.dispatcher.changeFileLineSelection(repository, file, selection)
+    }
   }
 
   private onDiscardChanges = (
     diff: ITextDiff,
     diffSelection: DiffSelection
   ) => {
+    if (this.lineSelectionDisabled) {
+      return
+    }
+
     if (this.props.askForConfirmationOnDiscardChanges) {
       this.props.dispatcher.showPopup({
         type: PopupType.ConfirmDiscardSelection,
@@ -84,18 +100,12 @@ export class Changes extends React.Component<IChangesProps, {}> {
   }
 
   public render() {
-    const diff = this.props.diff
-    const file = this.props.file
-    const isReadonly =
-      this.props.isCommitting ||
-      (enableHideWhitespaceInDiffOption() && this.props.hideWhitespaceInDiff)
-
     return (
-      <div className="changed-file">
-        <ChangedFileDetails
-          path={file.path}
-          status={file.status}
-          diff={diff}
+      <div className="diff-container">
+        <DiffHeader
+          path={this.props.file.path}
+          status={this.props.file.status}
+          diff={this.props.diff}
           showSideBySideDiff={this.props.showSideBySideDiff}
           onShowSideBySideDiffChanged={this.onShowSideBySideDiffChanged}
           hideWhitespaceInDiff={this.props.hideWhitespaceInDiff}
@@ -106,18 +116,21 @@ export class Changes extends React.Component<IChangesProps, {}> {
         <SeamlessDiffSwitcher
           repository={this.props.repository}
           imageDiffType={this.props.imageDiffType}
-          file={file}
-          readOnly={isReadonly}
+          file={this.props.file}
+          readOnly={false}
           onIncludeChanged={this.onDiffLineIncludeChanged}
           onDiscardChanges={this.onDiscardChanges}
-          diff={diff}
+          diff={this.props.diff}
           hideWhitespaceInDiff={this.props.hideWhitespaceInDiff}
           showSideBySideDiff={this.props.showSideBySideDiff}
+          showDiffCheckMarks={this.props.showDiffCheckMarks}
           askForConfirmationOnDiscardChanges={
             this.props.askForConfirmationOnDiscardChanges
           }
           onOpenBinaryFile={this.props.onOpenBinaryFile}
+          onOpenSubmodule={this.props.onOpenSubmodule}
           onChangeImageDiffType={this.props.onChangeImageDiffType}
+          onHideWhitespaceInDiffChanged={this.onHideWhitespaceInDiffChanged}
         />
       </div>
     )

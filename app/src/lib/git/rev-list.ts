@@ -58,7 +58,14 @@ export async function getAheadBehind(
   // `--left-right` annotates the list of commits in the range with which side
   // they're coming from. When used with `--count`, it tells us how many
   // commits we have from the two different sides of the range.
-  const args = ['rev-list', '--left-right', '--count', range, '--']
+  const args = [
+    'rev-list',
+    '--left-right',
+    '--count',
+    '--end-of-options',
+    range,
+    '--',
+  ]
   const result = await git(args, repository.path, 'getAheadBehind', {
     expectedErrors: new Set([GitError.BadRevision]),
   })
@@ -141,12 +148,13 @@ export async function getCommitsInRange(
 ): Promise<ReadonlyArray<CommitOneLine> | null> {
   const args = [
     'rev-list',
-    range,
     '--reverse',
     // the combination of these two arguments means each line of the stdout
     // will contain the full commit sha and a commit summary
     `--oneline`,
     `--no-abbrev-commit`,
+    '--end-of-options',
+    range,
     '--',
   ]
 
@@ -181,4 +189,28 @@ export async function getCommitsInRange(
   }
 
   return commits
+}
+
+/**
+ * Determine if merge commits exist in history after given commit
+ * If commitRef is null, goes back to HEAD of branch.
+ */
+export async function doMergeCommitsExistAfterCommit(
+  repository: Repository,
+  commitRef: string | null
+): Promise<boolean> {
+  const revision = commitRef === null ? 'HEAD' : revRange(commitRef, 'HEAD')
+  const args = [
+    'rev-list',
+    '-1',
+    '--merges',
+    '--end-of-options',
+    revision,
+    '--',
+  ]
+
+  return git(args, repository.path, 'doMergeCommitsExistAfterCommit', {
+    // 128 here means there's no HEAD, i.e we're on an unborn branch
+    successExitCodes: new Set([0, 128]),
+  }).then(x => x.stdout.length > 0)
 }

@@ -23,13 +23,6 @@ export interface IOpenRepositoryFromURLAction {
   readonly filepath: string | null
 }
 
-export interface IOpenRepositoryFromPathAction {
-  readonly name: 'open-repository-from-path'
-
-  /** The local path to open. */
-  readonly path: string
-}
-
 export interface IUnknownAction {
   readonly name: 'unknown'
   readonly url: string
@@ -38,7 +31,6 @@ export interface IUnknownAction {
 export type URLActionType =
   | IOAuthAction
   | IOpenRepositoryFromURLAction
-  | IOpenRepositoryFromPathAction
   | IUnknownAction
 
 // eslint-disable-next-line @typescript-eslint/naming-convention
@@ -101,7 +93,7 @@ export function parseAppURL(url: string): URLActionType {
   }
 
   // Trim the trailing / from the URL
-  const parsedPath = pathName.substr(1)
+  const parsedPath = pathName.substring(1)
 
   if (actionName === 'openrepo') {
     const pr = getQueryStringValue(query, 'pr')
@@ -129,13 +121,6 @@ export function parseAppURL(url: string): URLActionType {
       branch,
       pr,
       filepath,
-    }
-  }
-
-  if (actionName === 'openlocalrepo') {
-    return {
-      name: 'open-repository-from-path',
-      path: decodeURIComponent(parsedPath),
     }
   }
 

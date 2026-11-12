@@ -1,22 +1,18 @@
 import * as React from 'react'
-import { ipcRenderer, remote } from 'electron'
-import { ICrashDetails, ErrorType } from './shared'
+import { ErrorType } from './shared'
 import { TitleBar } from '../ui/window/title-bar'
 import { encodePathAsUrl } from '../lib/path'
-import {
-  WindowState,
-  getWindowState,
-  windowStateChannelName,
-} from '../lib/window-state'
-import { Octicon, OcticonSymbol } from '../ui/octicons'
+import { WindowState } from '../lib/window-state'
+import { Octicon } from '../ui/octicons'
+import * as octicons from '../ui/octicons/octicons.generated'
 import { Button } from '../ui/lib/button'
 import { LinkButton } from '../ui/lib/link-button'
 import { getVersion } from '../ui/lib/app-proxy'
 import { getOS } from '../lib/get-os'
+import * as ipcRenderer from '../lib/ipc-renderer'
+import { getCurrentWindowState } from '../ui/main-process-proxy'
 
-// This is a weird one, let's leave it as a placeholder
-// eslint-disable-next-line @typescript-eslint/no-empty-interface
-interface ICrashAppProps {}
+type CrashAppProps = Record<string, never>
 
 interface ICrashAppState {
   /**
@@ -34,7 +30,7 @@ interface ICrashAppState {
   /**
    * The current state of the Window, ie maximized, minimized full-screen etc.
    */
-  readonly windowState: WindowState
+  readonly windowState: WindowState | null
 }
 
 // Note that we're reusing the welcome illustration here, any changes to it
@@ -88,30 +84,46 @@ function prepareErrorMessage(error: Error) {
  * Exercise caution when working with the crash process. If the crash
  * process itself crashes we've failed.
  */
-export class CrashApp extends React.Component<ICrashAppProps, ICrashAppState> {
-  public constructor(props: ICrashAppProps) {
+export class CrashApp extends React.Component<CrashAppProps, ICrashAppState> {
+  public constructor(props: CrashAppProps) {
     super(props)
 
     this.state = {
-      windowState: getWindowState(remote.getCurrentWindow()),
+      windowState: null,
     }
+
+    this.initializeWindowState()
   }
 
   public componentDidMount() {
-    const window = remote.getCurrentWindow()
+    ipcRenderer.on('window-state-changed', this.onWindowStateChanged)
 
-    ipcRenderer.on(windowStateChannelName, () => {
-      this.setState({ windowState: getWindowState(window) })
-    })
-
-    ipcRenderer.on(
-      'error',
-      (event: Electron.IpcRendererEvent, crashDetails: ICrashDetails) => {
-        this.setState(crashDetails)
-      }
-    )
+    ipcRenderer.on('error', (_, crashDetails) => this.setState(crashDetails))
 
     ipcRenderer.send('crash-ready')
+  }
+
+  public componentWillUnmount() {
+    ipcRenderer.removeListener(
+      'window-state-changed',
+      this.onWindowStateChanged
+    )
+  }
+
+  private initializeWindowState = async () => {
+    const windowState = await getCurrentWindowState()
+    if (windowState === undefined) {
+      return
+    }
+
+    this.setState({ windowState })
+  }
+
+  private onWindowStateChanged = (
+    _: Electron.IpcRendererEvent,
+    windowState: WindowState
+  ) => {
+    this.setState({ windowState })
   }
 
   private onQuitButtonClicked = (e: React.MouseEvent<HTMLButtonElement>) => {
@@ -127,7 +139,7 @@ export class CrashApp extends React.Component<ICrashAppProps, ICrashAppState> {
 
     return (
       <header>
-        <Octicon symbol={OcticonSymbol.stop} className="error-icon" />
+        <Octicon symbol={octicons.stop} className="error-icon" />
         <h1>{message}</h1>
       </header>
     )
@@ -187,7 +199,9 @@ export class CrashApp extends React.Component<ICrashAppProps, ICrashAppState> {
   }
 
   private renderBackgroundGraphics() {
-    return <img className="background-graphic-bottom" src={BottomImageUri} />
+    return (
+      <img className="background-graphic-bottom" alt="" src={BottomImageUri} />
+    )
   }
 
   public render() {

@@ -1,125 +1,187 @@
-import * as Os from 'os'
 import * as Path from 'path'
-import * as FSE from 'fs-extra'
-
+import type { Repository } from '../../models/repository'
+import type { WorktreeEntry, WorktreeType } from '../../models/worktree'
+import { pathExists } from '../path-exists'
 import { git } from './core'
-import { v4 as uuid } from 'uuid'
 
-import { Repository, LinkedWorkTree } from '../../models/repository'
-import { getMatches } from '../helpers/regex'
+export function parseWorktreePorcelainOutput(
+  stdout: string
+): ReadonlyArray<WorktreeEntry> {
+  if (stdout.trim().length === 0) {
+    return []
+  }
 
-const DesktopWorkTreePrefix = 'github-desktop-worktree-'
+  // With -z, worktree blocks are separated by double NUL and fields within
+  // a block are separated by single NUL
+  const blocks = stdout.replace(/\0$/, '').split('\0\0')
+  const entries: WorktreeEntry[] = []
 
-/** Enumerate the list of work trees reported by Git for a repository */
-export async function listWorkTrees(
-  repository: Repository
-): Promise<ReadonlyArray<LinkedWorkTree>> {
+  for (let i = 0; i < blocks.length; i++) {
+    const lines = blocks[i].split('\0')
+    let path = ''
+    let head = ''
+    let branch: string | null = null
+    let isDetached = false
+    let isLocked = false
+    let isPrunable = false
+
+    for (const line of lines) {
+      if (line.startsWith('worktree ')) {
+        // Git for Windows will output paths using forward slashes, i.e.
+        // c:/Users/niik/... but repositories added in Desktop always pass
+        // through getRepositoryType which uses path.resolve to deduce the
+        // absolute top level directory and that will normalize paths as well
+        // so by normalizing here we can be more confident about comparing paths
+        path = Path.normalize(line.substring('worktree '.length))
+      } else if (line.startsWith('HEAD ')) {
+        head = line.substring('HEAD '.length)
+      } else if (line.startsWith('branch ')) {
+        branch = line.substring('branch '.length)
+      } else if (line === 'detached') {
+        isDetached = true
+      } else if (line === 'locked' || line.startsWith('locked ')) {
+        isLocked = true
+      } else if (line === 'prunable' || line.startsWith('prunable ')) {
+        isPrunable = true
+      }
+    }
+
+    const type: WorktreeType = i === 0 ? 'main' : 'linked'
+    entries.push({ path, head, branch, isDetached, type, isLocked, isPrunable })
+  }
+
+  return entries
+}
+
+export async function listWorktrees(
+  repositoryOrPath: Repository | string
+): Promise<ReadonlyArray<WorktreeEntry>> {
   const result = await git(
-    ['worktree', 'list', '--porcelain'],
-    repository.path,
-    'listWorkTrees'
+    ['worktree', 'list', '--porcelain', '-z'],
+    typeof repositoryOrPath === 'string'
+      ? repositoryOrPath
+      : repositoryOrPath.path,
+    'listWorktrees'
   )
 
-  const worktrees = new Array<LinkedWorkTree>()
+  return parseWorktreePorcelainOutput(result.stdout)
+}
 
-  // the porcelain output from git-worktree covers multiple lines
-  const listWorkTreeRe = /worktree (.*)\nHEAD ([a-f0-9]*)\n(branch .*|detached)\n/gm
+export async function listWorktreesFromGitDir(
+  gitDir: string
+): Promise<ReadonlyArray<WorktreeEntry>> {
+  const result = await git(
+    ['--git-dir', gitDir, 'worktree', 'list', '--porcelain', '-z'],
+    gitDir,
+    'listWorktreesFromGitDir'
+  )
 
-  getMatches(result.stdout, listWorkTreeRe).forEach(m => {
-    if (m.length === 4) {
-      worktrees.push({
-        path: m[1],
-        head: m[2],
-      })
-    } else {
-      log.debug(
-        `[listWorkTrees] match '${m[0]}' does not have the expected data or output. Skipping...`
-      )
-    }
-  })
-
-  return worktrees
+  return parseWorktreePorcelainOutput(result.stdout)
 }
 
 /**
- * Creates a temporary work tree for use in Desktop, even if one already exists
- * for that repository. Won't modify the repository's working directory.
- * _The returned worktree will be checked out to the given commit._
+ * Resolve the path to the main worktree of the repository the given repository
+ * belongs to, or null if it is already the main worktree or cannot be resolved.
+ *
+ * Prefers the path recorded when Desktop switched onto the worktree, falling
+ * back to the worktree's administrative git dir for repositories recorded
+ * before that path was persisted. The fallback only works while that metadata
+ * exists — `git worktree remove` and `git worktree prune` both delete it.
  */
-export async function createTemporaryWorkTree(
-  repository: Repository,
-  commit: string
-): Promise<LinkedWorkTree> {
-  const workTreePath = await FSE.mkdtemp(getTemporaryDirectoryPrefix())
-  await git(
-    ['worktree', 'add', '-f', workTreePath, commit],
-    repository.path,
-    'addWorkTree'
-  )
-  // Because Git doesn't give enough information from stdout for the previous
-  // Git call, this function enumerates the available worktrees to find the
-  // expected worktree
+export async function resolveMainWorktreePath(
+  repository: Repository
+): Promise<string | null> {
+  const { mainWorktreePath, gitDir, path } = repository
 
-  const workTrees = await listWorkTrees(repository)
-
-  const directoryName = Path.basename(workTreePath)
-  const workTree = workTrees.find(t => Path.basename(t.path) === directoryName)
-
-  // intentionally vague here to cover `undefined` and `null`
-  if (!workTree) {
-    throw new Error(
-      `[addWorkTree] Unable to find created worktree "${directoryName}"`
-    )
+  if (mainWorktreePath === path) {
+    return null
   }
 
-  return workTree
-}
+  // A recorded path can outlive the location it names, so treat it as a hint
+  // rather than the answer — otherwise a stale one would suppress the lookup
+  // below, which may well still work.
+  if (mainWorktreePath !== undefined && (await pathExists(mainWorktreePath))) {
+    return mainWorktreePath
+  }
 
-/** Cleanup the temporary worktree at a given location */
-export async function destroyWorkTree(
-  repository: Repository,
-  workTree: LinkedWorkTree
-): Promise<true> {
-  await git(
-    ['worktree', 'remove', '-f', workTree.path],
-    repository.path,
-    'removeWorkTree'
+  if (gitDir === undefined) {
+    return null
+  }
+
+  const mainWorktree = (await listWorktreesFromGitDir(gitDir)).find(
+    wt => wt.type === 'main'
   )
-  return true
+
+  return mainWorktree === undefined || mainWorktree.path === path
+    ? null
+    : mainWorktree.path
 }
 
-// creates a unique (to desktop) path in the OS's temp dir
-function getTemporaryDirectoryPrefix() {
-  return Path.join(Os.tmpdir(), `${DesktopWorkTreePrefix}${uuid()}`)
+/** Options for creating and checking out a worktree. */
+export interface IAddWorktreeOptions {
+  /** Branch name used with -b (create new branch). */
+  readonly createBranch?: string
+  /** Commit-ish to check out (branch name, ref, or SHA). */
+  readonly commitish?: string
 }
 
-async function findTemporaryWorkTrees(
-  repository: Repository
-): Promise<ReadonlyArray<LinkedWorkTree>> {
-  const workTrees = await listWorkTrees(repository)
-
-  // always exclude the first entry as that will be "main" worktree and we
-  // should not even look at it funny
-  const candidateWorkTrees = workTrees.slice(1)
-
-  return candidateWorkTrees.filter(t => {
-    // NOTE:
-    // we can't reliably check the full path here because Git seems to be
-    // prefixing the temporary paths on macOS with a `/private` prefix, and
-    // NodeJS doesn't seem to include this when we ask for the temporary
-    // directory for the OS
-    const directoryName = Path.basename(t.path)
-    return directoryName.startsWith(DesktopWorkTreePrefix)
-  })
-}
-
-/** Enumerate and cleanup any worktrees generated by Desktop */
-export async function cleanupTemporaryWorkTrees(
-  repository: Repository
+export async function addWorktree(
+  repository: Repository,
+  path: string,
+  options: IAddWorktreeOptions = {}
 ): Promise<void> {
-  const temporaryWorkTrees = await findTemporaryWorkTrees(repository)
+  const args = ['worktree', 'add']
 
-  for (const workTree of temporaryWorkTrees) {
-    await destroyWorkTree(repository, workTree)
+  if (options.createBranch) {
+    args.push('-b', options.createBranch)
   }
+
+  args.push('--', path)
+
+  if (options.commitish) {
+    args.push(options.commitish)
+  }
+
+  await git(args, repository.path, 'addWorktree')
+}
+
+export async function removeWorktree(
+  repositoryPath: string,
+  worktreePath: string,
+  force: boolean = false
+): Promise<void> {
+  const args = ['worktree', 'remove']
+  if (force) {
+    args.push('--force')
+  }
+  args.push(worktreePath)
+
+  await git(args, repositoryPath, 'removeWorktree')
+}
+
+/**
+ * Move (rename) a linked worktree from `oldPath` to `newPath`.
+ *
+ * Git is run from the main worktree rather than from `repository.path` since
+ * the repository is frequently the very worktree being moved, and Windows
+ * refuses to rename a directory that is the working directory of a process.
+ */
+export async function moveWorktree(
+  repository: Repository,
+  oldPath: string,
+  newPath: string
+): Promise<void> {
+  const mainWorktree = (await listWorktrees(repository)).find(
+    wt => wt.type === 'main'
+  )
+
+  if (mainWorktree === undefined) {
+    throw new Error('Could not determine the main worktree of the repository')
+  }
+
+  await git(
+    ['worktree', 'move', '--', oldPath, newPath],
+    mainWorktree.path,
+    'moveWorktree'
+  )
 }

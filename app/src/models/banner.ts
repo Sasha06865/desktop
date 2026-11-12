@@ -1,3 +1,4 @@
+import { Emoji } from '../lib/emoji'
 import { Popup } from './popup'
 
 export enum BannerType {
@@ -9,6 +10,13 @@ export enum BannerType {
   SuccessfulCherryPick = 'SuccessfulCherryPick',
   CherryPickConflictsFound = 'CherryPickConflictsFound',
   CherryPickUndone = 'CherryPickUndone',
+  SquashUndone = 'SquashUndone',
+  ReorderUndone = 'ReorderUndone',
+  OpenThankYouCard = 'OpenThankYouCard',
+  SuccessfulSquash = 'SuccessfulSquash',
+  SuccessfulReorder = 'SuccessfulReorder',
+  ConflictsFound = 'ConflictsFound',
+  OSVersionNoLongerSupported = 'OSVersionNoLongerSupported',
 }
 
 export type Banner =
@@ -52,9 +60,9 @@ export type Banner =
       /** name of the branch that was cherry picked to */
       readonly targetBranchName: string
       /** number of commits cherry picked */
-      readonly countCherryPicked: number
+      readonly count: number
       /** callback to run when user clicks undo link in banner */
-      readonly onUndoCherryPick: () => void
+      readonly onUndo: () => void
     }
   | {
       readonly type: BannerType.CherryPickConflictsFound
@@ -70,3 +78,47 @@ export type Banner =
       /** number of commits cherry picked */
       readonly countCherryPicked: number
     }
+  | {
+      readonly type: BannerType.OpenThankYouCard
+      readonly emoji: Map<string, Emoji>
+      readonly onOpenCard: () => void
+      readonly onThrowCardAway: () => void
+    }
+  | {
+      readonly type: BannerType.SuccessfulSquash
+      /** number of commits squashed */
+      readonly count: number
+      /** callback to run when user clicks undo link in banner */
+      readonly onUndo: () => void
+    }
+  | {
+      readonly type: BannerType.SquashUndone
+      /** number of commits squashed */
+      readonly commitsCount: number
+    }
+  | {
+      readonly type: BannerType.SuccessfulReorder
+      /** number of commits reordered */
+      readonly count: number
+      /** callback to run when user clicks undo link in banner */
+      readonly onUndo: () => void
+    }
+  | {
+      readonly type: BannerType.ReorderUndone
+      /** number of commits reordered */
+      readonly commitsCount: number
+    }
+  | {
+      readonly type: BannerType.ConflictsFound
+      /**
+       * Description of the operation to continue
+       * Examples:
+       *  - rebasing <strong>target-branch-name</strong>
+       *  - cherry-picking onto <strong>target-branch-name</strong>
+       *  - squashing commits on <strong>target-branch-name</strong>
+       */
+      readonly operationDescription: string | JSX.Element
+      /** callback to run when user clicks on link in banner text */
+      readonly onOpenConflictsDialog: () => void
+    }
+  | { readonly type: BannerType.OSVersionNoLongerSupported }

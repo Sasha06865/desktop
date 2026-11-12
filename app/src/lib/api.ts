@@ -1,6 +1,9 @@
-import * as OS from 'os'
 import * as URL from 'url'
 import { Account } from '../models/account'
+import {
+  ICopilotCommitMessage,
+  parseCopilotCommitMessage,
+} from './copilot-commit-message'
 
 import {
   request,
@@ -8,11 +11,23 @@ import {
   HTTPMethod,
   APIError,
   urlWithQueryString,
+  getUserAgent,
 } from './http'
-import { AuthenticationMode } from './2fa'
-import { uuid } from './uuid'
-import username from 'username'
 import { GitProtocol } from './remote-parsing'
+import {
+  getEndpointVersion,
+  isDotCom,
+  isGHE,
+  isGHES,
+  updateEndpointVersion,
+} from './endpoint-capabilities'
+import {
+  clearCertificateErrorSuppressionFor,
+  suppressCertificateErrorFor,
+} from './suppress-certificate-error'
+import { HttpStatusCode } from './http-status-code'
+import { CopilotError, parseCopilotPaymentRequiredError } from './copilot-error'
+import { BypassReasonType } from '../ui/secret-scanning/bypass-push-protection-dialog'
 
 const envEndpoint = process.env['DESKTOP_GITHUB_DOTCOM_API_ENDPOINT']
 const envHTMLURL = process.env['DESKTOP_GITHUB_DOTCOM_HTML_URL']
@@ -21,6 +36,45 @@ const envAdditionalCookies =
 
 if (envAdditionalCookies !== undefined) {
   document.cookie += '; ' + envAdditionalCookies
+}
+
+type AffiliationFilter =
+  | 'owner'
+  | 'collaborator'
+  | 'organization_member'
+  | 'owner,collabor'
+  | 'owner,organization_member'
+  | 'collaborator,organization_member'
+  | 'owner,collaborator,organization_member'
+
+/** Response type of GraphQL query of Copilot-related info */
+type ViewerCopilotResponse = {
+  readonly data: {
+    readonly viewer: {
+      readonly copilotEndpoints: {
+        readonly api: string
+      }
+      readonly copilotLicenseType: string
+      readonly isCopilotDesktopEnabled: boolean
+    }
+  }
+}
+
+/** Copilot-related info relevant to Desktop */
+type UserCopilotInfo = {
+  readonly isCopilotDesktopEnabled: boolean
+  readonly copilotEndpoint: string
+  readonly copilotLicenseType: string
+}
+
+/** Response type Copilot chat completions response API */
+type CopilotChatCompletionResponse = {
+  readonly choices: ReadonlyArray<{
+    readonly index: number
+    readonly message: {
+      readonly content: string
+    }
+  }>
 }
 
 /**
@@ -45,7 +99,15 @@ interface IFetchAllOptions<T> {
    *
    * @param results  All results retrieved thus far
    */
-  continue?: (results: ReadonlyArray<T>) => boolean
+  continue?: (results: ReadonlyArray<T>) => boolean | Promise<boolean>
+
+  /**
+   * An optional callback which is invoked after each page of results is loaded
+   * from the API. This can be used to enable streaming of results.
+   *
+   * @param page The last fetched page of results
+   */
+  onPage?: (page: ReadonlyArray<T>) => void
 
   /**
    * Calculate the next page path given the response.
@@ -76,24 +138,10 @@ if (!ClientID || !ClientID.length || !ClientSecret || !ClientSecret.length) {
   )
 }
 
-type GitHubAccountType = 'User' | 'Organization'
+export type GitHubAccountType = 'User' | 'Organization'
 
-/** The OAuth scopes we want to request from GitHub.com. */
-const DotComOAuthScopes = ['repo', 'user', 'workflow']
-
-/**
- * The OAuth scopes we want to request from GitHub
- * Enterprise.
- */
-const EnterpriseOAuthScopes = ['repo', 'user']
-
-enum HttpStatusCode {
-  NotModified = 304,
-  NotFound = 404,
-}
-
-/** The note URL used for authorizations the app creates. */
-const NoteURL = 'https://desktop.github.com/'
+/** The OAuth scopes we want to request */
+const oauthScopes = ['repo', 'user', 'workflow']
 
 /**
  * Information about a repository as returned by the GitHub API.
@@ -195,9 +243,9 @@ export interface IAPIOrganization {
  */
 export interface IAPIIdentity {
   readonly id: number
-  readonly url: string
   readonly login: string
   readonly avatar_url: string
+  readonly html_url: string
   readonly type: GitHubAccountType
 }
 
@@ -211,7 +259,7 @@ export interface IAPIIdentity {
  */
 interface IAPIFullIdentity {
   readonly id: number
-  readonly url: string
+  readonly html_url: string
   readonly login: string
   readonly avatar_url: string
 
@@ -227,6 +275,9 @@ interface IAPIFullIdentity {
    */
   readonly email: string | null
   readonly type: GitHubAccountType
+  readonly plan?: {
+    readonly name: string
+  }
 }
 
 /** The users we get from the mentionables endpoint. */
@@ -254,6 +305,11 @@ export interface IAPIMentionableUser {
    * a real name for their public profile.
    */
   readonly name: string | null
+}
+
+/** The response we get from the desktop_internal/features endpoint. */
+interface IUserFeaturesResponse {
+  readonly features: ReadonlyArray<string>
 }
 
 /**
@@ -291,18 +347,23 @@ export interface IAPIIssue {
 export type APIRefState = 'failure' | 'pending' | 'success' | 'error'
 
 /** The overall status of a check run */
-export type APICheckStatus = 'queued' | 'in_progress' | 'completed'
+export enum APICheckStatus {
+  Queued = 'queued',
+  InProgress = 'in_progress',
+  Completed = 'completed',
+}
 
 /** The conclusion of a completed check run */
-export type APICheckConclusion =
-  | 'action_required'
-  | 'cancelled'
-  | 'timed_out'
-  | 'failure'
-  | 'neutral'
-  | 'success'
-  | 'skipped'
-  | 'stale'
+export enum APICheckConclusion {
+  ActionRequired = 'action_required',
+  Canceled = 'cancelled',
+  TimedOut = 'timed_out',
+  Failure = 'failure',
+  Neutral = 'neutral',
+  Success = 'success',
+  Skipped = 'skipped',
+  Stale = 'stale',
+}
 
 /**
  * The API response for a combined view of a commit
@@ -310,7 +371,7 @@ export type APICheckConclusion =
  */
 export interface IAPIRefStatusItem {
   readonly state: APIRefState
-  readonly target_url: string
+  readonly target_url: string | null
   readonly description: string
   readonly context: string
   readonly id: number
@@ -329,22 +390,88 @@ export interface IAPIRefCheckRun {
   readonly status: APICheckStatus
   readonly conclusion: APICheckConclusion | null
   readonly name: string
-  readonly output: IAPIRefCheckRunOutput
   readonly check_suite: IAPIRefCheckRunCheckSuite
+  readonly app: IAPIRefCheckRunApp
+  readonly completed_at: string
+  readonly started_at: string
+  readonly html_url: string
+  readonly pull_requests: ReadonlyArray<IAPIPullRequest>
+}
+
+// NB. Only partially mapped
+export interface IAPIRefCheckRunApp {
+  readonly name: string
 }
 
 // NB. Only partially mapped
 export interface IAPIRefCheckRunOutput {
   readonly title: string | null
+  readonly summary: string | null
+  readonly text: string | null
 }
 
 export interface IAPIRefCheckRunCheckSuite {
   readonly id: number
 }
 
+export interface IAPICheckSuite {
+  readonly id: number
+  readonly rerequestable: boolean
+  readonly runs_rerequestable: boolean
+  readonly status: APICheckStatus
+  readonly created_at: string
+}
+
 export interface IAPIRefCheckRuns {
   readonly total_count: number
   readonly check_runs: IAPIRefCheckRun[]
+}
+
+interface IAPIWorkflowRuns {
+  readonly total_count: number
+  readonly workflow_runs: ReadonlyArray<IAPIWorkflowRun>
+}
+// NB. Only partially mapped
+export interface IAPIWorkflowRun {
+  readonly id: number
+  /**
+   * The workflow_id is the id of the workflow not the individual run.
+   **/
+  readonly workflow_id: number
+  readonly cancel_url: string
+  readonly created_at: string
+  readonly logs_url: string
+  readonly name: string
+  readonly rerun_url: string
+  readonly check_suite_id: number
+  readonly event: string
+}
+
+export interface IAPIWorkflowJobs {
+  readonly total_count: number
+  readonly jobs: IAPIWorkflowJob[]
+}
+
+// NB. Only partially mapped
+export interface IAPIWorkflowJob {
+  readonly id: number
+  readonly name: string
+  readonly status: APICheckStatus
+  readonly conclusion: APICheckConclusion | null
+  readonly completed_at: string
+  readonly started_at: string
+  readonly steps: ReadonlyArray<IAPIWorkflowJobStep>
+  readonly html_url: string
+}
+
+export interface IAPIWorkflowJobStep {
+  readonly name: string
+  readonly number: number
+  readonly status: APICheckStatus
+  readonly conclusion: APICheckConclusion | null
+  readonly completed_at: string
+  readonly started_at: string
+  readonly log: string
 }
 
 /** Protected branch information returned by the GitHub API */
@@ -400,6 +527,100 @@ export interface IAPIBranch {
   readonly protected: boolean
 }
 
+/** Repository rule information returned by the GitHub API */
+export interface IAPIRepoRule {
+  /**
+   * The ID of the ruleset this rule is configured in.
+   */
+  readonly ruleset_id: number
+
+  /**
+   * The type of the rule.
+   */
+  readonly type: APIRepoRuleType
+
+  /**
+   * The parameters that apply to the rule if it is a metadata rule.
+   * Other rule types may have parameters, but they are not used in
+   * this app so they are ignored. Do not attempt to use this field
+   * unless you know `type` matches a metadata rule type.
+   */
+  readonly parameters?: IAPIRepoRuleMetadataParameters
+}
+
+/**
+ * A non-exhaustive list of rules that can be configured. Only the rule
+ * types used by this app are included.
+ */
+export enum APIRepoRuleType {
+  Creation = 'creation',
+  Update = 'update',
+  RequiredDeployments = 'required_deployments',
+  RequiredSignatures = 'required_signatures',
+  RequiredStatusChecks = 'required_status_checks',
+  PullRequest = 'pull_request',
+  CommitMessagePattern = 'commit_message_pattern',
+  CommitAuthorEmailPattern = 'commit_author_email_pattern',
+  CommitterEmailPattern = 'committer_email_pattern',
+  BranchNamePattern = 'branch_name_pattern',
+}
+
+/**
+ * A ruleset returned from the GitHub API's "get all rulesets for a repo" endpoint.
+ * This endpoint returns a slimmed-down version of the full ruleset object, though
+ * only the ID is used.
+ */
+export interface IAPISlimRepoRuleset {
+  readonly id: number
+}
+
+/**
+ * A ruleset returned from the GitHub API's "get a ruleset for a repo" endpoint.
+ */
+export interface IAPIRepoRuleset extends IAPISlimRepoRuleset {
+  /**
+   * Whether the user making the API request can bypass the ruleset.
+   */
+  readonly current_user_can_bypass: 'always' | 'pull_requests_only' | 'never'
+}
+
+/**
+ * Metadata parameters for a repo rule metadata rule.
+ */
+export interface IAPIRepoRuleMetadataParameters {
+  /**
+   * User-supplied name/description of the rule
+   */
+  name: string
+
+  /**
+   * Whether the operator is negated. For example, if `true`
+   * and `operator` is `starts_with`, then the rule
+   * will be negated to 'does not start with'.
+   */
+  negate: boolean
+
+  /**
+   * The pattern to match against. If the operator is 'regex', then
+   * this is a regex string match. Otherwise, it is a raw string match
+   * of the type specified by `operator` with no additional parsing.
+   */
+  pattern: string
+
+  /**
+   * The type of match to use for the pattern. For example, `starts_with`
+   * means `pattern` must be at the start of the string.
+   */
+  operator: APIRepoRuleMetadataOperator
+}
+
+export enum APIRepoRuleMetadataOperator {
+  StartsWith = 'starts_with',
+  EndsWith = 'ends_with',
+  Contains = 'contains',
+  RegexMatch = 'regex',
+}
+
 interface IAPIPullRequestRef {
   readonly ref: string
   readonly sha: string
@@ -420,29 +641,33 @@ export interface IAPIPullRequest {
   readonly user: IAPIIdentity
   readonly head: IAPIPullRequestRef
   readonly base: IAPIPullRequestRef
+  readonly body: string
   readonly state: 'open' | 'closed'
   readonly draft?: boolean
 }
 
-/** The metadata about a GitHub server. */
-export interface IServerMetadata {
-  /**
-   * Does the server support password-based authentication? If not, the user
-   * must go through the OAuth flow to authenticate.
-   */
-  readonly verifiable_password_authentication: boolean
+/** Information about a pull request review as returned by the GitHub API. */
+export interface IAPIPullRequestReview {
+  readonly id: number
+  readonly user: IAPIIdentity
+  readonly body: string
+  readonly html_url: string
+  readonly submitted_at: string
+  readonly state:
+    | 'APPROVED'
+    | 'DISMISSED'
+    | 'PENDING'
+    | 'COMMENTED'
+    | 'CHANGES_REQUESTED'
 }
 
-/** The server response when handling the OAuth callback (with code) to obtain an access token */
-interface IAPIAccessToken {
-  readonly access_token: string
-  readonly scope: string
-  readonly token_type: string
-}
-
-/** The partial server response when creating a new authorization on behalf of a user */
-interface IAPIAuthorization {
-  readonly token: string
+/** Represents both issue comments and PR review comments */
+export interface IAPIComment {
+  readonly id: number
+  readonly body: string
+  readonly html_url: string
+  readonly user: IAPIIdentity
+  readonly created_at: string
 }
 
 /** The response we receive from fetching mentionables. */
@@ -572,22 +797,196 @@ function toGitHubIsoDateString(date: Date) {
   return date.toISOString().replace(/\.\d{3}Z$/, 'Z')
 }
 
+interface IAPIAliveSignedChannel {
+  readonly channel_name: string
+  readonly signed_channel: string
+}
+
+interface IAPIAliveWebSocket {
+  readonly url: string
+}
+
+type TokenInvalidatedCallback = (endpoint: string, token: string) => void
+
+export interface IAPICreatePushProtectionBypassResponse {
+  reason: BypassReasonType
+  expire_at: string
+  token_type: string
+}
+
 /**
  * An object for making authenticated requests to the GitHub API
  */
 export class API {
+  private static tokenProvider:
+    | ((endpoint: string, token: string) => Promise<string>)
+    | undefined
+  private static readonly tokenInvalidatedListeners =
+    new Set<TokenInvalidatedCallback>()
+
+  /** Install the renderer's shared credential authority. Returns a cleanup function. */
+  public static setTokenProvider(
+    provider: (endpoint: string, token: string) => Promise<string>
+  ) {
+    const previous = this.tokenProvider
+    this.tokenProvider = provider
+    return () => {
+      this.tokenProvider = previous
+    }
+  }
+
+  public static onTokenInvalidated(callback: TokenInvalidatedCallback) {
+    this.tokenInvalidatedListeners.add(callback)
+    return () => this.tokenInvalidatedListeners.delete(callback)
+  }
+
+  private static emitTokenInvalidated(endpoint: string, token: string) {
+    this.tokenInvalidatedListeners.forEach(callback =>
+      callback(endpoint, token)
+    )
+  }
+
   /** Create a new API client from the given account. */
   public static fromAccount(account: Account): API {
-    return new API(account.endpoint, account.token)
+    // Public-repository fallback must not inherit an unrelated account's sign-in state.
+    return new API(
+      account.endpoint,
+      account.token,
+      account.copilotEndpoint,
+      account.id !== -1
+    )
   }
 
   private endpoint: string
   private token: string
+  private copilotEndpoint?: string
 
   /** Create a new API client for the endpoint, authenticated with the token. */
-  public constructor(endpoint: string, token: string) {
+  public constructor(
+    endpoint: string,
+    token: string,
+    copilotEndpoint?: string,
+    /**
+     * Use the account store to resolve/refresh tokens and handle rejected tokens.
+     * Disable for new sign-in tokens and the anonymous public-repository fallback:
+     * those must use the supplied token, not another signed-in account's token.
+     */
+    private readonly manageAccountToken = true
+  ) {
     this.endpoint = endpoint
     this.token = token
+    this.copilotEndpoint = copilotEndpoint
+  }
+
+  /**
+   * Retrieves the name of the Alive channel used by Desktop to receive
+   * high-signal notifications.
+   */
+  public async getAliveDesktopChannel(): Promise<IAPIAliveSignedChannel | null> {
+    try {
+      const res = await this.ghRequest('GET', '/desktop_internal/alive-channel')
+      const signedChannel = await parsedResponse<IAPIAliveSignedChannel>(res)
+      return signedChannel
+    } catch (e) {
+      log.warn(`Alive channel request failed: ${e}`)
+      return null
+    }
+  }
+
+  /**
+   * Retrieves the URL for the Alive websocket.
+   *
+   * @returns The websocket URL if the request succeeded, null if the request
+   * failed with 404, otherwise it will throw an error.
+   *
+   * This behavior is expected by the AliveSession class constructor, to prevent
+   * it from hitting the endpoint many times if it's disabled.
+   */
+  public async getAliveWebSocketURL(): Promise<string | null> {
+    try {
+      const res = await this.ghRequest('GET', '/alive_internal/websocket-url')
+      if (res.status === HttpStatusCode.NotFound) {
+        return null
+      }
+      const websocket = await parsedResponse<IAPIAliveWebSocket>(res)
+      return websocket.url
+    } catch (e) {
+      log.warn(`Alive web socket request failed: ${e}`)
+      throw e
+    }
+  }
+
+  /**
+   * Fetch an issue comment (i.e. a comment on an issue or pull request).
+   *
+   * @param owner The owner of the repository
+   * @param name The name of the repository
+   * @param commentId The ID of the comment
+   *
+   * @returns The comment if it was found, null if it wasn't, or an error
+   * occurred.
+   */
+  public async fetchIssueComment(
+    owner: string,
+    name: string,
+    commentId: string
+  ): Promise<IAPIComment | null> {
+    try {
+      const response = await this.ghRequest(
+        'GET',
+        `repos/${owner}/${name}/issues/comments/${commentId}`
+      )
+      if (response.status === HttpStatusCode.NotFound) {
+        log.warn(
+          `fetchIssueComment: '${owner}/${name}/issues/comments/${commentId}' returned a 404`
+        )
+        return null
+      }
+      return await parsedResponse<IAPIComment>(response)
+    } catch (e) {
+      log.warn(
+        `fetchIssueComment: an error occurred for '${owner}/${name}/issues/comments/${commentId}'`,
+        e
+      )
+      return null
+    }
+  }
+
+  /**
+   * Fetch a pull request review comment (i.e. a comment that was posted as part
+   * of a review of a pull request).
+   *
+   * @param owner The owner of the repository
+   * @param name The name of the repository
+   * @param commentId The ID of the comment
+   *
+   * @returns The comment if it was found, null if it wasn't, or an error
+   * occurred.
+   */
+  public async fetchPullRequestReviewComment(
+    owner: string,
+    name: string,
+    commentId: string
+  ): Promise<IAPIComment | null> {
+    try {
+      const response = await this.ghRequest(
+        'GET',
+        `repos/${owner}/${name}/pulls/comments/${commentId}`
+      )
+      if (response.status === HttpStatusCode.NotFound) {
+        log.warn(
+          `fetchPullRequestReviewComment: '${owner}/${name}/pulls/comments/${commentId}' returned a 404`
+        )
+        return null
+      }
+      return await parsedResponse<IAPIComment>(response)
+    } catch (e) {
+      log.warn(
+        `fetchPullRequestReviewComment: an error occurred for '${owner}/${name}/pulls/comments/${commentId}'`,
+        e
+      )
+      return null
+    }
   }
 
   /** Fetch a repo by its owner and name. */
@@ -596,7 +995,7 @@ export class API {
     name: string
   ): Promise<IAPIFullRepository | null> {
     try {
-      const response = await this.request('GET', `repos/${owner}/${name}`)
+      const response = await this.ghRequest('GET', `repos/${owner}/${name}`)
       if (response.status === HttpStatusCode.NotFound) {
         log.warn(`fetchRepository: '${owner}/${name}' returned a 404`)
         return null
@@ -606,6 +1005,25 @@ export class API {
       log.warn(`fetchRepository: an error occurred for '${owner}/${name}'`, e)
       return null
     }
+  }
+
+  /**
+   * Fetch a repo by its owner and name to find out whether the account can
+   * access it.
+   *
+   * Resolves to null when the repository isn't visible to the account (404).
+   * Unlike `fetchRepository`, any other failure (network errors, rate limits,
+   * server errors) is thrown so that it isn't mistaken for a lack of access.
+   */
+  public async fetchRepositoryIfAccessible(
+    owner: string,
+    name: string
+  ): Promise<IAPIFullRepository | null> {
+    const response = await this.ghRequest('GET', `repos/${owner}/${name}`)
+    if (response.status === HttpStatusCode.NotFound) {
+      return null
+    }
+    return parsedResponse<IAPIFullRepository>(response)
   }
 
   /**
@@ -633,7 +1051,11 @@ export class API {
     name: string,
     protocol: GitProtocol | undefined
   ): Promise<IAPIRepositoryCloneInfo | null> {
-    const response = await this.request('GET', `repos/${owner}/${name}`)
+    const response = await this.ghRequest('GET', `repos/${owner}/${name}`, {
+      // Make sure we don't run into cache issues when fetching the repositories,
+      // specially after repositories have been renamed.
+      reloadCache: true,
+    })
 
     if (response.status === HttpStatusCode.NotFound) {
       return null
@@ -646,31 +1068,46 @@ export class API {
     }
   }
 
-  /** Fetch all repos a user has access to. */
-  public async fetchRepositories(): Promise<ReadonlyArray<
-    IAPIRepository
-  > | null> {
+  /**
+   * Fetch all repos a user has access to in a streaming fashion. The callback
+   * will be called for each new page fetched from the API.
+   */
+  public async streamUserRepositories(
+    callback: (repos: ReadonlyArray<IAPIRepository>) => void,
+    affiliation?: AffiliationFilter,
+    options?: IFetchAllOptions<IAPIRepository>
+  ) {
     try {
-      const repositories = await this.fetchAll<IAPIRepository>('user/repos')
-      // "But wait, repositories can't have a null owner" you say.
-      // Ordinarily you'd be correct but turns out there's super
-      // rare circumstances where a user has been deleted but the
-      // repository hasn't. Such cases are usually addressed swiftly
-      // but in some cases like GitHub Enterprise instances
-      // they can linger for longer than we'd like so we'll make
-      // sure to exclude any such dangling repository, chances are
-      // they won't be cloneable anyway.
-      return repositories.filter(x => x.owner !== null)
+      const base = 'user/repos'
+      const path = affiliation ? `${base}?affiliation=${affiliation}` : base
+
+      await this.fetchAll<IAPIRepository>(path, {
+        ...options,
+        // "But wait, repositories can't have a null owner" you say.
+        // Ordinarily you'd be correct but turns out there's super
+        // rare circumstances where a user has been deleted but the
+        // repository hasn't. Such cases are usually addressed swiftly
+        // but in some cases like GitHub Enterprise instances
+        // they can linger for longer than we'd like so we'll make
+        // sure to exclude any such dangling repository, chances are
+        // they won't be cloneable anyway.
+        onPage: page => {
+          callback(page.filter(x => x.owner !== null))
+          options?.onPage?.(page)
+        },
+      })
     } catch (error) {
-      log.warn(`fetchRepositories: ${error}`)
-      return null
+      log.warn(
+        `streamUserRepositories: failed with endpoint ${this.endpoint}`,
+        error
+      )
     }
   }
 
   /** Fetch the logged in account. */
   public async fetchAccount(): Promise<IAPIFullIdentity> {
     try {
-      const response = await this.request('GET', 'user')
+      const response = await this.ghRequest('GET', 'user')
       const result = await parsedResponse<IAPIFullIdentity>(response)
       return result
     } catch (e) {
@@ -682,7 +1119,7 @@ export class API {
   /** Fetch the current user's emails. */
   public async fetchEmails(): Promise<ReadonlyArray<IAPIEmail>> {
     try {
-      const response = await this.request('GET', 'user/emails')
+      const response = await this.ghRequest('GET', 'user/emails')
       const result = await parsedResponse<ReadonlyArray<IAPIEmail>>(response)
 
       return Array.isArray(result) ? result : []
@@ -711,10 +1148,12 @@ export class API {
   ): Promise<IAPIFullRepository> {
     try {
       const apiPath = org ? `orgs/${org.login}/repos` : 'user/repos'
-      const response = await this.request('POST', apiPath, {
-        name,
-        description,
-        private: private_,
+      const response = await this.ghRequest('POST', apiPath, {
+        body: {
+          name,
+          description,
+          private: private_,
+        },
       })
 
       return await parsedResponse<IAPIFullRepository>(response)
@@ -742,7 +1181,7 @@ export class API {
   ): Promise<IAPIFullRepository> {
     try {
       const apiPath = `/repos/${owner}/${name}/forks`
-      const response = await this.request('POST', apiPath)
+      const response = await this.ghRequest('POST', apiPath)
       return await parsedResponse<IAPIFullRepository>(response)
     } catch (e) {
       log.error(
@@ -848,7 +1287,7 @@ export class API {
           // updated_at field we can safely say that if the last item
           // is modified after our sinceTime then haven't reached the
           // end of updated PRs.
-          const last = results[results.length - 1]
+          const last = results.at(-1)
           return last !== undefined && Date.parse(last.updated_at) > sinceTime
         },
         // We can't ignore errors here as that might mean that we haven't
@@ -870,11 +1309,110 @@ export class API {
   public async fetchPullRequest(owner: string, name: string, prNumber: string) {
     try {
       const path = `/repos/${owner}/${name}/pulls/${prNumber}`
-      const response = await this.request('GET', path)
+      const response = await this.ghRequest('GET', path)
       return await parsedResponse<IAPIPullRequest>(response)
     } catch (e) {
       log.warn(`failed fetching PR for ${owner}/${name}/pulls/${prNumber}`, e)
       throw e
+    }
+  }
+
+  /**
+   * Fetch a single pull request review in the given repository
+   */
+  public async fetchPullRequestReview(
+    owner: string,
+    name: string,
+    prNumber: string,
+    reviewId: string
+  ) {
+    try {
+      const path = `/repos/${owner}/${name}/pulls/${prNumber}/reviews/${reviewId}`
+      const response = await this.ghRequest('GET', path)
+      return await parsedResponse<IAPIPullRequestReview>(response)
+    } catch (e) {
+      log.debug(
+        `failed fetching PR review ${reviewId} for ${owner}/${name}/pulls/${prNumber}`,
+        e
+      )
+      return null
+    }
+  }
+
+  /** Fetches all reviews from a given pull request. */
+  public async fetchPullRequestReviews(
+    owner: string,
+    name: string,
+    prNumber: string
+  ) {
+    try {
+      const path = `/repos/${owner}/${name}/pulls/${prNumber}/reviews`
+      const response = await this.ghRequest('GET', path)
+      return await parsedResponse<IAPIPullRequestReview[]>(response)
+    } catch (e) {
+      log.debug(
+        `failed fetching PR reviews for ${owner}/${name}/pulls/${prNumber}`,
+        e
+      )
+      return []
+    }
+  }
+
+  /** Fetches all review comments from a given pull request. */
+  public async fetchPullRequestReviewComments(
+    owner: string,
+    name: string,
+    prNumber: string,
+    reviewId: string
+  ) {
+    try {
+      const path = `/repos/${owner}/${name}/pulls/${prNumber}/reviews/${reviewId}/comments`
+      const response = await this.ghRequest('GET', path)
+      return await parsedResponse<IAPIComment[]>(response)
+    } catch (e) {
+      log.debug(
+        `failed fetching PR review comments for ${owner}/${name}/pulls/${prNumber}`,
+        e
+      )
+      return []
+    }
+  }
+
+  /** Fetches all review comments from a given pull request. */
+  public async fetchPullRequestComments(
+    owner: string,
+    name: string,
+    prNumber: string
+  ) {
+    try {
+      const path = `/repos/${owner}/${name}/pulls/${prNumber}/comments`
+      const response = await this.ghRequest('GET', path)
+      return await parsedResponse<IAPIComment[]>(response)
+    } catch (e) {
+      log.debug(
+        `failed fetching PR comments for ${owner}/${name}/pulls/${prNumber}`,
+        e
+      )
+      return []
+    }
+  }
+
+  /** Fetches all comments from a given issue. */
+  public async fetchIssueComments(
+    owner: string,
+    name: string,
+    issueNumber: string
+  ) {
+    try {
+      const path = `/repos/${owner}/${name}/issues/${issueNumber}/comments`
+      const response = await this.ghRequest('GET', path)
+      return await parsedResponse<IAPIComment[]>(response)
+    } catch (e) {
+      log.debug(
+        `failed fetching issue comments for ${owner}/${name}/issues/${issueNumber}`,
+        e
+      )
+      return []
     }
   }
 
@@ -884,11 +1422,14 @@ export class API {
   public async fetchCombinedRefStatus(
     owner: string,
     name: string,
-    ref: string
+    ref: string,
+    reloadCache: boolean = false
   ): Promise<IAPIRefStatus | null> {
     const safeRef = encodeURIComponent(ref)
     const path = `repos/${owner}/${name}/commits/${safeRef}/status?per_page=100`
-    const response = await this.request('GET', path)
+    const response = await this.ghRequest('GET', path, {
+      reloadCache,
+    })
 
     try {
       return await parsedResponse<IAPIRefStatus>(response)
@@ -907,7 +1448,8 @@ export class API {
   public async fetchRefCheckRuns(
     owner: string,
     name: string,
-    ref: string
+    ref: string,
+    reloadCache: boolean = false
   ): Promise<IAPIRefCheckRuns | null> {
     const safeRef = encodeURIComponent(ref)
     const path = `repos/${owner}/${name}/commits/${safeRef}/check-runs?per_page=100`
@@ -915,7 +1457,10 @@ export class API {
       Accept: 'application/vnd.github.antiope-preview+json',
     }
 
-    const response = await this.request('GET', path, undefined, headers)
+    const response = await this.ghRequest('GET', path, {
+      customHeaders: headers,
+      reloadCache,
+    })
 
     try {
       return await parsedResponse<IAPIRefCheckRuns>(response)
@@ -926,6 +1471,198 @@ export class API {
       )
       return null
     }
+  }
+
+  /**
+   * List workflow runs for a repository filtered by branch and event type of
+   * pull_request
+   */
+  public async fetchPRWorkflowRunsByBranchName(
+    owner: string,
+    name: string,
+    branchName: string
+  ): Promise<IAPIWorkflowRuns | null> {
+    const path = `repos/${owner}/${name}/actions/runs?event=pull_request&branch=${encodeURIComponent(
+      branchName
+    )}`
+    const customHeaders = {
+      Accept: 'application/vnd.github.antiope-preview+json',
+    }
+    const response = await this.ghRequest('GET', path, { customHeaders })
+    try {
+      return await parsedResponse<IAPIWorkflowRuns>(response)
+    } catch {
+      log.debug(
+        `Failed fetching workflow runs for ${branchName} (${owner}/${name})`
+      )
+    }
+    return null
+  }
+
+  /**
+   * Return the workflow run for a given check_suite_id.
+   *
+   * A check suite is a reference for a set check runs.
+   * A workflow run is a reference for set a of workflows for the GitHub Actions
+   * check runner.
+   *
+   * If a check suite is comprised of check runs ran by actions, there will be
+   * one workflow run that represents that check suite. Thus, if this api should
+   * either return an empty array indicating there are no actions runs for that
+   * check_suite_id (so check suite was not ran by actions) or an array with a
+   * single element.
+   */
+  public async fetchPRActionWorkflowRunByCheckSuiteId(
+    owner: string,
+    name: string,
+    checkSuiteId: number
+  ): Promise<IAPIWorkflowRun | null> {
+    const path = `repos/${owner}/${name}/actions/runs?event=pull_request&check_suite_id=${checkSuiteId}`
+    const customHeaders = {
+      Accept: 'application/vnd.github.antiope-preview+json',
+    }
+    const response = await this.ghRequest('GET', path, { customHeaders })
+    try {
+      const apiWorkflowRuns = await parsedResponse<IAPIWorkflowRuns>(response)
+
+      if (apiWorkflowRuns.workflow_runs.length > 0) {
+        return apiWorkflowRuns.workflow_runs[0]
+      }
+    } catch {
+      log.debug(
+        `Failed fetching workflow runs for ${checkSuiteId} (${owner}/${name})`
+      )
+    }
+    return null
+  }
+
+  /**
+   * List workflow run jobs for a given workflow run
+   */
+  public async fetchWorkflowRunJobs(
+    owner: string,
+    name: string,
+    workflowRunId: number
+  ): Promise<IAPIWorkflowJobs | null> {
+    const path = `repos/${owner}/${name}/actions/runs/${workflowRunId}/jobs`
+    const customHeaders = {
+      Accept: 'application/vnd.github.antiope-preview+json',
+    }
+    const response = await this.ghRequest('GET', path, {
+      customHeaders,
+    })
+    try {
+      return await parsedResponse<IAPIWorkflowJobs>(response)
+    } catch {
+      log.debug(
+        `Failed fetching workflow jobs (${owner}/${name}) workflow run: ${workflowRunId}`
+      )
+    }
+    return null
+  }
+
+  /**
+   * Triggers GitHub to rerequest an existing check suite, without pushing new
+   * code to a repository.
+   */
+  public async rerequestCheckSuite(
+    owner: string,
+    name: string,
+    checkSuiteId: number
+  ): Promise<boolean> {
+    const path = `/repos/${owner}/${name}/check-suites/${checkSuiteId}/rerequest`
+
+    return this.ghRequest('POST', path)
+      .then(x => x.ok)
+      .catch(err => {
+        log.debug(
+          `Failed retry check suite id ${checkSuiteId} (${owner}/${name})`,
+          err
+        )
+        return false
+      })
+  }
+
+  /**
+   * Re-run all of the failed jobs and their dependent jobs in a workflow run
+   * using the id of the workflow run.
+   */
+  public async rerunFailedJobs(
+    owner: string,
+    name: string,
+    workflowRunId: number
+  ): Promise<boolean> {
+    const path = `/repos/${owner}/${name}/actions/runs/${workflowRunId}/rerun-failed-jobs`
+
+    return this.ghRequest('POST', path)
+      .then(x => x.ok)
+      .catch(err => {
+        log.debug(
+          `Failed to rerun failed workflow jobs for (${owner}/${name}): ${workflowRunId}`,
+          err
+        )
+        return false
+      })
+  }
+
+  /**
+   * Re-run a job and its dependent jobs in a workflow run.
+   */
+  public async rerunJob(
+    owner: string,
+    name: string,
+    jobId: number
+  ): Promise<boolean> {
+    const path = `/repos/${owner}/${name}/actions/jobs/${jobId}/rerun`
+
+    return this.ghRequest('POST', path)
+      .then(x => x.ok)
+      .catch(err => {
+        log.debug(
+          `Failed to rerun workflow job (${owner}/${name}): ${jobId}`,
+          err
+        )
+        return false
+      })
+  }
+
+  public async getAvatarToken() {
+    return this.ghRequest('GET', `/desktop/avatar-token`)
+      .then(x => x.json())
+      .then((x: unknown) =>
+        x &&
+        typeof x === 'object' &&
+        'avatar_token' in x &&
+        typeof x.avatar_token === 'string'
+          ? x.avatar_token
+          : null
+      )
+      .catch(err => {
+        log.debug(`Failed to load avatar token`, err)
+        return null
+      })
+  }
+
+  /**
+   * Gets a single check suite using its id
+   */
+  public async fetchCheckSuite(
+    owner: string,
+    name: string,
+    checkSuiteId: number
+  ): Promise<IAPICheckSuite | null> {
+    const path = `/repos/${owner}/${name}/check-suites/${checkSuiteId}`
+    const response = await this.ghRequest('GET', path)
+
+    try {
+      return await parsedResponse<IAPICheckSuite>(response)
+    } catch {
+      log.debug(
+        `[fetchCheckSuite] Failed fetch check suite id ${checkSuiteId} (${owner}/${name})`
+      )
+    }
+
+    return null
   }
 
   /**
@@ -947,7 +1684,9 @@ export class API {
     }
 
     try {
-      const response = await this.request('GET', path, undefined, headers)
+      const response = await this.ghRequest('GET', path, {
+        customHeaders: headers,
+      })
       return await parsedResponse<IAPIPushControl>(response)
     } catch (err) {
       log.info(
@@ -967,20 +1706,104 @@ export class API {
     }
   }
 
+  /**
+   * Fetch the repository's protected branches.
+   *
+   * Returns an empty array when the request succeeds and no protected branches
+   * exist, or null when the protected branch list could not be refreshed.
+   */
   public async fetchProtectedBranches(
     owner: string,
     name: string
-  ): Promise<ReadonlyArray<IAPIBranch>> {
+  ): Promise<ReadonlyArray<IAPIBranch> | null> {
     const path = `repos/${owner}/${name}/branches?protected=true`
     try {
-      const response = await this.request('GET', path)
+      const response = await this.ghRequest('GET', path)
       return await parsedResponse<IAPIBranch[]>(response)
     } catch (err) {
       log.info(
         `[fetchProtectedBranches] unable to list protected branches`,
         err
       )
-      return new Array<IAPIBranch>()
+      return null
+    }
+  }
+
+  /**
+   * Fetches all repository rules that apply to the provided branch.
+   */
+  public async fetchRepoRulesForBranch(
+    owner: string,
+    name: string,
+    branch: string
+  ): Promise<ReadonlyArray<IAPIRepoRule>> {
+    const path = `repos/${owner}/${name}/rules/branches/${encodeURIComponent(
+      branch
+    )}`
+    try {
+      const response = await this.ghRequest('GET', path)
+      return await parsedResponse<IAPIRepoRule[]>(response)
+    } catch (err) {
+      // If the repository isn't owned by the current user there's no way for us
+      // to preemptively check whether rulesets are enabled so we give it a shot
+      // but there's no need to log if it fails. Same with 404s, i.e the user
+      // doesn't have access to the repo any more or it's been deleted.
+      if (!isRulesetsNotEnabledError(err) && !isNotFoundApiError(err)) {
+        log.info(
+          `[fetchRepoRulesForBranch] unable to fetch repo rules for branch: ${branch} | ${path}`,
+          err
+        )
+      }
+      return new Array<IAPIRepoRule>()
+    }
+  }
+
+  /**
+   * Fetches slim versions of all repo rulesets for the given repository. Utilize the cache
+   * in IAppState instead of querying this if possible.
+   */
+  public async fetchAllRepoRulesets(
+    owner: string,
+    name: string
+  ): Promise<ReadonlyArray<IAPISlimRepoRuleset> | null> {
+    const path = `repos/${owner}/${name}/rulesets`
+    try {
+      const response = await this.ghRequest('GET', path)
+      return await parsedResponse<ReadonlyArray<IAPISlimRepoRuleset>>(response)
+    } catch (err) {
+      // If the repository isn't owned by the current user there's no way for us
+      // to preemptively check whether rulesets are enabled so we give it a shot
+      // but there's no need to log if it fails. Same with 404s, i.e the user
+      // doesn't have access to the repo any more or it's been deleted.
+      if (!isRulesetsNotEnabledError(err) && !isNotFoundApiError(err)) {
+        log.info(
+          `[fetchAllRepoRulesets] unable to fetch all repo rulesets | ${path}`,
+          err
+        )
+      }
+      return null
+    }
+  }
+
+  /**
+   * Fetches the repo ruleset with the given ID. Utilize the cache in IAppState
+   * instead of querying this if possible.
+   */
+  public async fetchRepoRuleset(
+    owner: string,
+    name: string,
+    id: number
+  ): Promise<IAPIRepoRuleset | null> {
+    const path = `repos/${owner}/${name}/rulesets/${id}`
+    try {
+      const response = await this.ghRequest('GET', path)
+      return await parsedResponse<IAPIRepoRuleset>(response)
+    } catch (err) {
+      log.info(
+        `[fetchRepoRuleset] unable to fetch repo ruleset for ID: ${id} | ${path}`,
+        err
+      )
+      return null
     }
   }
 
@@ -997,34 +1820,251 @@ export class API {
     const params = { per_page: `${opts.perPage}` }
 
     let nextPath: string | null = urlWithQueryString(path, params)
+    let page: ReadonlyArray<T> = []
     do {
-      const response: Response = await this.request('GET', nextPath)
+      const response: Response = await this.ghRequest('GET', nextPath)
       if (opts.suppressErrors !== false && !response.ok) {
         log.warn(`fetchAll: '${path}' returned a ${response.status}`)
         return buf
       }
 
-      const items = await parsedResponse<ReadonlyArray<T>>(response)
-      if (items) {
-        buf.push(...items)
+      page = await parsedResponse<ReadonlyArray<T>>(response)
+      if (page) {
+        buf.push(...page)
+        opts.onPage?.(page)
       }
 
       nextPath = opts.getNextPagePath
         ? opts.getNextPagePath(response)
         : getNextPagePathFromLink(response)
-    } while (nextPath && (!opts.continue || opts.continue(buf)))
+    } while (nextPath && (!opts.continue || (await opts.continue(buf))))
 
     return buf
   }
 
   /** Make an authenticated request to the client's endpoint with its token. */
-  private request(
+  private async request(
+    endpoint: string,
     method: HTTPMethod,
     path: string,
-    body?: Object,
-    customHeaders?: Object
+    options: {
+      body?: object
+      customHeaders?: object
+      reloadCache?: boolean
+    } = {},
+    resolvedToken?: string
   ): Promise<Response> {
-    return request(this.endpoint, this.token, method, path, body, customHeaders)
+    const token =
+      resolvedToken ??
+      (API.tokenProvider && this.manageAccountToken
+        ? await API.tokenProvider(this.endpoint, this.token)
+        : this.token)
+    return await request(
+      endpoint,
+      token,
+      method,
+      path,
+      options.body,
+      options.customHeaders,
+      options.reloadCache
+    )
+  }
+
+  /**
+   * Make an authenticated request to the client's endpoint with its token.
+   * Used for GitHub API requests.
+   */
+  private async ghRequest(
+    method: HTTPMethod,
+    path: string,
+    options: {
+      body?: object
+      customHeaders?: object
+      reloadCache?: boolean
+    } = {}
+  ): Promise<Response> {
+    const token =
+      API.tokenProvider && this.manageAccountToken
+        ? await API.tokenProvider(this.endpoint, this.token)
+        : this.token
+    const response = await this.request(
+      this.endpoint,
+      method,
+      path,
+      options,
+      token
+    )
+
+    // Only consider invalid token when the status is 401 and the response has
+    // the X-GitHub-Request-Id header, meaning it comes from GH(E) and not from
+    // any kind of proxy/gateway. For more info see #12943
+    // We're also not considering a token has been invalidated when the reason
+    // behind a 401 is the fact that any kind of 2 factor auth is required.
+    if (
+      this.manageAccountToken &&
+      response.status === HttpStatusCode.Unauthorized &&
+      response.headers.has('X-GitHub-Request-Id') &&
+      !response.headers.has('X-GitHub-OTP')
+    ) {
+      API.emitTokenInvalidated(this.endpoint, token)
+    }
+
+    tryUpdateEndpointVersionFromResponse(this.endpoint, response)
+
+    return response
+  }
+
+  /**
+   * Make an authenticated request to the client's Copilot endpoint with its
+   * token. Used for Copilot API requests.
+   */
+  private async copilotRequest(
+    path: string,
+    message: string
+  ): Promise<CopilotChatCompletionResponse> {
+    if (!this.copilotEndpoint) {
+      throw new Error('No Copilot endpoint available')
+    }
+
+    const response = await this.request(this.copilotEndpoint, 'POST', path, {
+      body: {
+        messages: [
+          {
+            role: 'user',
+            content: message,
+          },
+        ],
+        stream: false,
+        response_format: {
+          type: 'json_object',
+        },
+      },
+      customHeaders: {
+        'X-Initiator': 'user',
+        'X-Interaction-ID': crypto.randomUUID(),
+        'X-Interaction-Type': 'generateCommitMessage',
+      },
+    })
+
+    if (response.status === HttpStatusCode.TooManyRequests) {
+      const retryAfter = response.headers.get('Retry-After')
+      if (retryAfter) {
+        throw new CopilotError(
+          `Rate limited, retry after ${retryAfter} seconds.`,
+          response.status
+        )
+      } else {
+        throw new CopilotError(
+          'Rate limited, try again in a few minutes.',
+          response.status
+        )
+      }
+    } else if (response.status === HttpStatusCode.PaymentRequired) {
+      throw parseCopilotPaymentRequiredError(
+        await response.text(),
+        response.headers.get('Retry-After')
+      )
+    } else if (response.status === HttpStatusCode.Unauthorized) {
+      throw new CopilotError(
+        'Unauthorized: error with authentication.',
+        response.status
+      )
+    } else if (response.status === HttpStatusCode.Forbidden) {
+      const body = await response.text()
+      if (body.includes('unauthorized: not licensed to use Copilot')) {
+        throw new CopilotError(
+          'Unauthorized: not licensed to use Copilot.',
+          response.status
+        )
+      } else if (
+        body.includes(
+          'unauthorized: not authorized to use this Copilot feature'
+        )
+      ) {
+        throw new CopilotError(
+          'Unauthorized: not authorized to use this Copilot feature.',
+          response.status
+        )
+      } else if (
+        body.includes('integration does not have GitHub chat enabled')
+      ) {
+        throw new CopilotError(
+          'Integration does not have GitHub chat enabled.',
+          response.status
+        )
+      } else {
+        throw new CopilotError('Unauthorized: unknown.', response.status)
+      }
+    } else if (response.status === 466) {
+      throw new CopilotError(
+        'Client issue: unsupported API version.',
+        response.status
+      )
+    } else if (response.status >= HttpStatusCode.BadRequest) {
+      const internalError = `Internal server error, code: ${
+        response.status
+      }, request ID: ${response.headers.get('X-Github-Request-Id')}.`
+      console.error(
+        `Copilot request failed with status ${response.status}: ${internalError}`
+      )
+      throw new CopilotError(
+        'Something went wrong. Please, try again later.',
+        response.status
+      )
+    }
+
+    const text = await response.text()
+
+    // Responses include multiple lines starting with "data: " followed by
+    // a JSON object. We're only interested in the JSON object of the first line.
+    const lines = text.split('\n')
+    const DataLinePrefix = 'data: '
+
+    for (const line of lines) {
+      if (line.startsWith(DataLinePrefix)) {
+        const json = JSON.parse(line.substring(DataLinePrefix.length))
+        return json as CopilotChatCompletionResponse
+      }
+    }
+
+    throw new Error('No data line found in response')
+  }
+
+  /**
+   * Leverages Copilot to generate the commit details (title and description)
+   * for a given diff.
+   *
+   * @param diff Diff of changes to be committed, in git format
+   * @returns Commit details (title and description) generated by Copilot
+   */
+  public async getDiffChangesCommitMessage(
+    diff: string
+  ): Promise<ICopilotCommitMessage> {
+    try {
+      const response = await this.copilotRequest(
+        '/agents/github-desktop-commit-message-generation',
+        diff
+      )
+
+      const choice = response.choices.at(0)
+
+      if (!choice) {
+        throw new Error('No choice found in response')
+      }
+
+      const message = choice.message.content
+      if (!message) {
+        throw new Error('No message found in response')
+      }
+
+      return parseCopilotCommitMessage(message)
+    } catch (e) {
+      log.warn(
+        `getDiffChangesCommitMessage: failed with endpoint ${this.endpoint}`,
+        e
+      )
+      throw e
+    }
   }
 
   /**
@@ -1037,7 +2077,7 @@ export class API {
   ): Promise<number | null> {
     const path = `repos/${owner}/${name}/git`
     try {
-      const response = await this.request('HEAD', path)
+      const response = await this.ghRequest('HEAD', path)
       const interval = response.headers.get('x-poll-interval')
       if (interval) {
         const parsed = parseInt(interval, 10)
@@ -1067,7 +2107,9 @@ export class API {
 
     try {
       const path = `repos/${owner}/${name}/mentionables/users`
-      const response = await this.request('GET', path, undefined, headers)
+      const response = await this.ghRequest('GET', path, {
+        customHeaders: headers,
+      })
 
       if (response.status === HttpStatusCode.NotFound) {
         log.warn(`fetchMentionables: '${path}' returned a 404`)
@@ -1094,12 +2136,12 @@ export class API {
    */
   public async fetchUser(login: string): Promise<IAPIFullIdentity | null> {
     try {
-      const response = await this.request(
+      const response = await this.ghRequest(
         'GET',
         `users/${encodeURIComponent(login)}`
       )
 
-      if (response.status === 404) {
+      if (response.status === HttpStatusCode.NotFound) {
         return null
       }
 
@@ -1109,150 +2151,161 @@ export class API {
       throw e
     }
   }
-}
 
-export enum AuthorizationResponseKind {
-  Authorized,
-  Failed,
-  TwoFactorAuthenticationRequired,
-  UserRequiresVerification,
-  PersonalAccessTokenBlocked,
-  Error,
-  EnterpriseTooOld,
   /**
-   * The API has indicated that the user is required to go through
-   * the web authentication flow.
+   * Fetches the Desktop-specific features that are enabled for the user.
+   *
+   * @returns An array of strings with the feature flags enabled for the user.
    */
-  WebFlowRequired,
-}
-
-export type AuthorizationResponse =
-  | { kind: AuthorizationResponseKind.Authorized; token: string }
-  | { kind: AuthorizationResponseKind.Failed; response: Response }
-  | {
-      kind: AuthorizationResponseKind.TwoFactorAuthenticationRequired
-      type: AuthenticationMode
-    }
-  | { kind: AuthorizationResponseKind.Error; response: Response }
-  | { kind: AuthorizationResponseKind.UserRequiresVerification }
-  | { kind: AuthorizationResponseKind.PersonalAccessTokenBlocked }
-  | { kind: AuthorizationResponseKind.EnterpriseTooOld }
-  | { kind: AuthorizationResponseKind.WebFlowRequired }
-
-/**
- * Create an authorization with the given login, password, and one-time
- * password.
- */
-export async function createAuthorization(
-  endpoint: string,
-  login: string,
-  password: string,
-  oneTimePassword: string | null
-): Promise<AuthorizationResponse> {
-  const creds = Buffer.from(`${login}:${password}`, 'utf8').toString('base64')
-  const authorization = `Basic ${creds}`
-  const optHeader = oneTimePassword ? { 'X-GitHub-OTP': oneTimePassword } : {}
-
-  const note = await getNote()
-
-  const response = await request(
-    endpoint,
-    null,
-    'POST',
-    'authorizations',
-    {
-      scopes: getOAuthScopesForEndpoint(endpoint),
-      client_id: ClientID,
-      client_secret: ClientSecret,
-      note: note,
-      note_url: NoteURL,
-      fingerprint: uuid(),
-    },
-    {
-      Authorization: authorization,
-      ...optHeader,
-    }
-  )
-
-  try {
-    const result = await parsedResponse<IAPIAuthorization>(response)
-    if (result) {
-      const token = result.token
-      if (token && typeof token === 'string' && token.length) {
-        return { kind: AuthorizationResponseKind.Authorized, token }
-      }
-    }
-  } catch (e) {
-    if (response.status === 401) {
-      const otpResponse = response.headers.get('x-github-otp')
-      if (otpResponse) {
-        const pieces = otpResponse.split(';')
-        if (pieces.length === 2) {
-          const type = pieces[1].trim()
-          switch (type) {
-            case 'app':
-              return {
-                kind: AuthorizationResponseKind.TwoFactorAuthenticationRequired,
-                type: AuthenticationMode.App,
-              }
-            case 'sms':
-              return {
-                kind: AuthorizationResponseKind.TwoFactorAuthenticationRequired,
-                type: AuthenticationMode.Sms,
-              }
-            default:
-              return { kind: AuthorizationResponseKind.Failed, response }
-          }
-        }
-      }
-
-      return { kind: AuthorizationResponseKind.Failed, response }
-    }
-
-    const apiError = e instanceof APIError && e.apiError
-    if (apiError) {
-      if (
-        response.status === 403 &&
-        apiError.message ===
-          'This API can only be accessed with username and password Basic Auth'
-      ) {
-        // Authorization API does not support providing personal access tokens
-        return { kind: AuthorizationResponseKind.PersonalAccessTokenBlocked }
-      } else if (response.status === 410) {
-        return { kind: AuthorizationResponseKind.WebFlowRequired }
-      } else if (response.status === 422) {
-        if (apiError.errors) {
-          for (const error of apiError.errors) {
-            const isExpectedResource =
-              error.resource.toLowerCase() === 'oauthaccess'
-            const isExpectedField = error.field.toLowerCase() === 'user'
-            if (isExpectedField && isExpectedResource) {
-              return {
-                kind: AuthorizationResponseKind.UserRequiresVerification,
-              }
-            }
-          }
-        } else if (
-          apiError.message === 'Invalid OAuth application client_id or secret.'
-        ) {
-          return { kind: AuthorizationResponseKind.EnterpriseTooOld }
-        }
-      }
+  public async fetchFeatureFlags(): Promise<ReadonlyArray<string> | undefined> {
+    try {
+      const response = await this.ghRequest('GET', '/desktop_internal/features')
+      const featuresResponse = await parsedResponse<IUserFeaturesResponse>(
+        response
+      )
+      return featuresResponse.features
+    } catch (e) {
+      log.warn(`fetchFeatureFlags: failed with endpoint ${this.endpoint}`, e)
+      return undefined
     }
   }
 
-  return { kind: AuthorizationResponseKind.Error, response }
+  /**
+   * Fetches the Copilot info related to the user (license and API endpoint).
+   *
+   * @returns Copilot license and API endpoint.
+   */
+  public async fetchUserCopilotInfo(): Promise<UserCopilotInfo | undefined> {
+    // Copilot is not available on GHES
+    if (isGHES(this.endpoint)) {
+      return undefined
+    }
+
+    const graphql = `
+    {
+      viewer {
+        copilotEndpoints {
+          api
+        }
+
+        copilotLicenseType
+        isCopilotDesktopEnabled
+      }
+    }
+    `
+
+    try {
+      const response = await this.ghRequest('POST', '/graphql', {
+        body: { query: graphql },
+        customHeaders: {
+          'GraphQL-Features': 'copilot_iap_max_sku',
+        },
+      })
+      if (response === null) {
+        return undefined
+      }
+
+      const json: ViewerCopilotResponse =
+        (await response.json()) as ViewerCopilotResponse
+      const { viewer } = json.data
+      return {
+        copilotEndpoint: viewer.copilotEndpoints.api,
+        isCopilotDesktopEnabled: viewer.isCopilotDesktopEnabled,
+        copilotLicenseType: viewer.copilotLicenseType,
+      }
+    } catch (e) {
+      log.warn(`fetchUserCopilotInfo: failed with endpoint ${this.endpoint}`, e)
+      return undefined
+    }
+  }
+
+  /**
+   * Creates a push protection bypass for a repository.
+   *
+   * This method sends a POST request to the GitHub API to create a bypass
+   * for push protection in a specified repository. The bypass is associated
+   * with a reason and a placeholder ID.
+   *
+   * @param owner - The owner of the repository.
+   * @param name - The name of the repository.
+   * @param reason - The reason for creating the bypass - false_positive, used_in_tests, will_fix_later.
+   * @param placeholderId - The placeholder ID associated with the bypass.
+   * @param bypassURL - The URL to retry the bypass creation on Github.com in case of failure.
+   * @returns A promise that resolves to the response of the bypass creation.
+   * @throws An error if the bypass creation fails, including a warning log.
+   */
+  public async createPushProtectionBypass(
+    owner: string,
+    name: string,
+    reason: BypassReasonType,
+    placeholderId: string,
+    bypassURL: string
+  ): Promise<IAPICreatePushProtectionBypassResponse> {
+    const path = `repos/${owner}/${name}/secret-scanning/push-protection-bypasses`
+    const body = {
+      reason,
+      placeholder_id: placeholderId,
+    }
+
+    try {
+      const response = await this.ghRequest('POST', path, { body })
+      return await parsedResponse<IAPICreatePushProtectionBypassResponse>(
+        response
+      )
+    } catch (e) {
+      const msg = `Unable to create push protection bypass.
+
+    Repository: ${owner}/${name}
+    Reason: ${reason}
+    Placeholder Id: ${placeholderId}.
+
+    Try again at: ${bypassURL}`
+
+      log.error(msg, e)
+      throw new Error(msg)
+    }
+  }
+}
+
+/** Revoke a token, optionally allowing the caller to cancel the request. */
+export async function deleteToken(
+  account: Pick<Account, 'endpoint' | 'token'>,
+  signal?: AbortSignal
+) {
+  try {
+    const creds = Buffer.from(`${ClientID}:${ClientSecret}`).toString('base64')
+    const response = await request(
+      account.endpoint,
+      null,
+      'DELETE',
+      `applications/${ClientID}/token`,
+      { access_token: account.token },
+      { Authorization: `Basic ${creds}` },
+      false,
+      signal
+    )
+
+    return response.status === 204
+  } catch (e) {
+    log.error(`deleteToken: failed with endpoint ${account.endpoint}`, e)
+    return false
+  }
 }
 
 /** Fetch the user authenticated by the token. */
 export async function fetchUser(
   endpoint: string,
-  token: string
+  token: string,
+  isNewAuthorization = false
 ): Promise<Account> {
-  const api = new API(endpoint, token)
+  const api = new API(endpoint, token, undefined, !isNewAuthorization)
   try {
-    const user = await api.fetchAccount()
-    const emails = await api.fetchEmails()
+    const [user, emails, copilotInfo, features] = await Promise.all([
+      api.fetchAccount(),
+      api.fetchEmails(),
+      api.fetchUserCopilotInfo(),
+      api.fetchFeatureFlags(),
+    ])
 
     return new Account(
       user.login,
@@ -1261,53 +2314,17 @@ export async function fetchUser(
       emails,
       user.avatar_url,
       user.id,
-      user.name || user.login
+      user.name || user.login,
+      user.plan?.name,
+      copilotInfo?.copilotEndpoint,
+      copilotInfo?.isCopilotDesktopEnabled,
+      features,
+      copilotInfo?.copilotLicenseType
     )
   } catch (e) {
     log.warn(`fetchUser: failed with endpoint ${endpoint}`, e)
     throw e
   }
-}
-
-/** Get metadata from the server. */
-export async function fetchMetadata(
-  endpoint: string
-): Promise<IServerMetadata | null> {
-  const url = `${endpoint}/meta`
-
-  try {
-    const response = await request(endpoint, null, 'GET', 'meta', undefined, {
-      'Content-Type': 'application/json',
-    })
-
-    const result = await parsedResponse<IServerMetadata>(response)
-    if (!result || result.verifiable_password_authentication === undefined) {
-      return null
-    }
-
-    return result
-  } catch (e) {
-    log.error(
-      `fetchMetadata: unable to load metadata from '${url}' as a fallback`,
-      e
-    )
-    return null
-  }
-}
-
-/** The note used for created authorizations. */
-async function getNote(): Promise<string> {
-  let localUsername = 'unknown'
-  try {
-    localUsername = await username()
-  } catch (e) {
-    log.error(
-      `getNote: unable to resolve machine username, using '${localUsername}' as a fallback`,
-      e
-    )
-  }
-
-  return `GitHub Desktop on ${localUsername}@${OS.hostname()}`
 }
 
 /**
@@ -1329,7 +2346,8 @@ export function getEndpointForRepository(url: string): string {
  * Get the URL for the HTML site. For example:
  *
  * https://api.github.com -> https://github.com
- * http://github.mycompany.com/api -> http://github.mycompany.com/
+ * http://github.mycompany.com/api -> http://github.mycompany.com
+ * https://github.mycompany.com:8443/api/v3 -> https://github.mycompany.com:8443
  */
 export function getHTMLURL(endpoint: string): string {
   if (envHTMLURL !== undefined) {
@@ -1347,20 +2365,37 @@ export function getHTMLURL(endpoint: string): string {
   if (endpoint === getDotComAPIEndpoint() && !envEndpoint) {
     return 'https://github.com'
   } else {
-    const parsed = URL.parse(endpoint)
-    return `${parsed.protocol}//${parsed.hostname}`
+    if (isGHE(endpoint)) {
+      const url = new URL.URL(endpoint)
+
+      url.pathname = '/'
+
+      if (url.hostname.startsWith('api.')) {
+        url.hostname = url.hostname.replace(/^api\./, '')
+      }
+
+      return url.toString()
+    }
+
+    // Use the origin rather than the hostname so that GitHub Enterprise
+    // Server instances running on a non-default port retain their port.
+    return new URL.URL(endpoint).origin
   }
 }
 
 /**
  * Get the API URL for an HTML URL. For example:
  *
- * http://github.mycompany.com -> http://github.mycompany.com/api/v3
+ * http://github.mycompany.com -> https://github.mycompany.com/api/v3
  */
 export function getEnterpriseAPIURL(endpoint: string): string {
-  const parsed = URL.parse(endpoint)
-  return `${parsed.protocol}//${parsed.hostname}/api/v3`
+  const { host } = new window.URL(endpoint)
+
+  return isGHE(endpoint) ? `https://api.${host}/` : `https://${host}/api/v3`
 }
+
+export const getAPIEndpoint = (endpoint: string) =>
+  isDotCom(endpoint) ? getDotComAPIEndpoint() : getEnterpriseAPIURL(endpoint)
 
 /** Get github.com's API endpoint. */
 export function getDotComAPIEndpoint(): string {
@@ -1376,51 +2411,138 @@ export function getDotComAPIEndpoint(): string {
   return 'https://api.github.com'
 }
 
-/** Get the account for the endpoint. */
-export function getAccountForEndpoint(
-  accounts: ReadonlyArray<Account>,
-  endpoint: string
-): Account | null {
-  return accounts.find(a => a.endpoint === endpoint) || null
-}
-
+/**
+ * Build an OAuth authorization URL.
+ *
+ * Supplying a login requests that account and disables sign-up. The caller
+ * must still verify the identity returned by OAuth.
+ */
 export function getOAuthAuthorizationURL(
   endpoint: string,
-  state: string
+  state: string,
+  login: string | undefined,
+  shortLived: boolean
 ): string {
   const urlBase = getHTMLURL(endpoint)
-  const scopes = getOAuthScopesForEndpoint(endpoint)
-  const scope = encodeURIComponent(scopes.join(' '))
-  return `${urlBase}/login/oauth/authorize?client_id=${ClientID}&scope=${scope}&state=${state}`
+  const scope = encodeURIComponent(
+    (shortLived && !isGHES(endpoint)
+      ? [...oauthScopes, 'offline_access']
+      : oauthScopes
+    ).join(' ')
+  )
+  // Without a specific login, let the user pick which of their browser's
+  // GitHub sessions to sign in with rather than silently using the active one.
+  const accountParameters =
+    login === undefined
+      ? '&prompt=select_account'
+      : `&login=${encodeURIComponent(login)}&allow_signup=false`
+
+  return new window.URL(
+    `/login/oauth/authorize?client_id=${ClientID}&scope=${scope}&state=${state}${accountParameters}`,
+    urlBase
+  ).toString()
 }
 
-export async function requestOAuthToken(
+function tryUpdateEndpointVersionFromResponse(
   endpoint: string,
-  code: string
-): Promise<string | null> {
-  try {
-    const urlBase = getHTMLURL(endpoint)
-    const response = await request(
-      urlBase,
-      null,
-      'POST',
-      'login/oauth/access_token',
-      {
-        client_id: ClientID,
-        client_secret: ClientSecret,
-        code: code,
-      }
-    )
-    const result = await parsedResponse<IAPIAccessToken>(response)
-    return result.access_token
-  } catch (e) {
-    log.warn(`requestOAuthToken: failed with endpoint ${endpoint}`, e)
-    return null
+  response: Response
+) {
+  const gheVersion = response.headers.get('x-github-enterprise-version')
+  if (gheVersion !== null) {
+    updateEndpointVersion(endpoint, gheVersion)
   }
 }
 
-function getOAuthScopesForEndpoint(endpoint: string) {
-  return endpoint === getDotComAPIEndpoint()
-    ? DotComOAuthScopes
-    : EnterpriseOAuthScopes
+const knownThirdPartyHosts = new Set([
+  'dev.azure.com',
+  'gitlab.com',
+  'bitbucket.org',
+  'amazonaws.com',
+  'visualstudio.com',
+])
+
+const isKnownThirdPartyHost = (hostname: string) => {
+  if (knownThirdPartyHosts.has(hostname)) {
+    return true
+  }
+
+  for (const knownHost of knownThirdPartyHosts) {
+    if (hostname.endsWith(`.${knownHost}`)) {
+      return true
+    }
+  }
+
+  return false
 }
+
+/**
+ * Attempts to determine whether or not the url belongs to a GitHub host.
+ *
+ * This is a best-effort attempt and may return `undefined` if encountering
+ * an error making the discovery request
+ */
+export async function isGitHubHost(url: string) {
+  const { hostname } = new window.URL(url)
+
+  const endpoint =
+    hostname === 'github.com' || hostname === 'api.github.com'
+      ? getDotComAPIEndpoint()
+      : getEnterpriseAPIURL(url)
+
+  if (isDotCom(endpoint) || isGHE(endpoint)) {
+    return true
+  }
+
+  if (isKnownThirdPartyHost(hostname)) {
+    return false
+  }
+
+  // github.example.com,
+  if (/(^|\.)(github)\./.test(hostname)) {
+    return true
+  }
+
+  // bitbucket.example.com, etc
+  if (/(^|\.)(bitbucket|gitlab)\./.test(hostname)) {
+    return false
+  }
+
+  if (getEndpointVersion(endpoint) !== null) {
+    return true
+  }
+
+  // Add a unique identifier to the URL to make sure our certificate error
+  // supression only catches this request
+  const metaUrl = `${endpoint}/meta?ghd=${crypto.randomUUID()}`
+
+  const ac = new AbortController()
+  const timeoutId = setTimeout(() => ac.abort(), 2000)
+  suppressCertificateErrorFor(metaUrl)
+  try {
+    const response = await fetch(metaUrl, {
+      headers: { 'user-agent': getUserAgent() },
+      signal: ac.signal,
+      credentials: 'omit',
+      method: 'HEAD',
+      redirect: 'error',
+    })
+
+    tryUpdateEndpointVersionFromResponse(endpoint, response)
+
+    return response.headers.has('x-github-request-id')
+  } catch (e) {
+    log.debug(`isGitHubHost: failed with endpoint ${endpoint}`, e)
+    return undefined
+  } finally {
+    clearTimeout(timeoutId)
+    clearCertificateErrorSuppressionFor(metaUrl)
+  }
+}
+
+const isRulesetsNotEnabledError = (error: any) =>
+  error instanceof APIError &&
+  error.responseStatus === 403 &&
+  /upgrade.*to enable this feature.*/i.test(error.apiError?.message ?? '')
+
+const isNotFoundApiError = (error: any) =>
+  error instanceof APIError && error.responseStatus === 404

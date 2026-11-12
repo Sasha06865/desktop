@@ -5,6 +5,7 @@ import {
 } from '../models/repository'
 import { GitHubRepository } from '../models/github-repository'
 import { getHTMLURL } from './api'
+import { Emoji } from './emoji'
 
 export enum TokenType {
   /*
@@ -28,6 +29,10 @@ export type EmojiMatch = {
   readonly text: string
   // The path on disk to the image.
   readonly path: string
+  // The unicode character of the emoji, if available
+  readonly emoji?: string
+  // The human description of the emoji, if available
+  readonly description?: string
 }
 
 export type HyperlinkMatch = {
@@ -54,14 +59,14 @@ type LookupResult = {
  * A look-ahead tokenizer designed for scanning commit messages for emoji, issues, mentions and links.
  */
 export class Tokenizer {
-  private readonly emoji: Map<string, string>
+  private readonly allEmoji: Map<string, Emoji>
   private readonly repository: GitHubRepository | null = null
 
   private _results = new Array<TokenResult>()
   private _currentString = ''
 
-  public constructor(emoji: Map<string, string>, repository?: Repository) {
-    this.emoji = emoji
+  public constructor(emoji: Map<string, Emoji>, repository?: Repository) {
+    this.allEmoji = emoji
 
     if (repository && isRepositoryWithGitHubRepository(repository)) {
       this.repository = getNonForkGitHubRepository(repository)
@@ -84,12 +89,7 @@ export class Tokenizer {
     }
   }
 
-  private getLastProcessedChar(): string | null {
-    if (this._currentString.length) {
-      return this._currentString[this._currentString.length - 1]
-    }
-    return null
-  }
+  private getLastProcessedChar = () => this._currentString?.at(-1)
 
   private scanForEndOfWord(text: string, index: number): number {
     const indexOfNextNewline = text.indexOf('\n', index + 1)
@@ -120,13 +120,19 @@ export class Tokenizer {
       return null
     }
 
-    const path = this.emoji.get(maybeEmoji)
-    if (!path) {
+    const emoji = this.allEmoji.get(maybeEmoji)
+    if (!emoji) {
       return null
     }
 
     this.flush()
-    this._results.push({ kind: TokenType.Emoji, text: maybeEmoji, path })
+    this._results.push({
+      kind: TokenType.Emoji,
+      text: maybeEmoji,
+      path: emoji.url,
+      emoji: emoji.emoji,
+      description: emoji.description,
+    })
     return { nextIndex }
   }
 
@@ -162,7 +168,7 @@ export class Tokenizer {
     }
 
     this.flush()
-    const id = parseInt(maybeIssue.substr(1), 10)
+    const id = parseInt(maybeIssue.substring(1), 10)
     if (isNaN(id)) {
       return null
     }
@@ -180,7 +186,7 @@ export class Tokenizer {
     // to ensure this isn't part of an email address, peek at the previous
     // character - if something is found and it's not whitespace, bail out
     const lastItem = this.getLastProcessedChar()
-    if (lastItem && lastItem !== ' ') {
+    if (lastItem && !/\s/.test(lastItem)) {
       return null
     }
 
@@ -198,7 +204,7 @@ export class Tokenizer {
     }
 
     this.flush()
-    const name = maybeMention.substr(1)
+    const name = maybeMention.substring(1)
     const url = `${getHTMLURL(repository.endpoint)}/${name}`
     this._results.push({ kind: TokenType.Link, text: maybeMention, url })
     return { nextIndex }
@@ -212,7 +218,7 @@ export class Tokenizer {
     // to ensure this isn't just the part of some word - if something is
     // found and it's not whitespace, bail out
     const lastItem = this.getLastProcessedChar()
-    if (lastItem && lastItem !== ' ') {
+    if (lastItem && !/\s/.test(lastItem)) {
       return null
     }
 

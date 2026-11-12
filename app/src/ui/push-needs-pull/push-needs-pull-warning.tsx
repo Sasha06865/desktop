@@ -33,7 +33,7 @@ export class PushNeedsPullWarning extends React.Component<
         title={
           __DARWIN__ ? 'Newer Commits on Remote' : 'Newer commits on remote'
         }
-        dismissable={!this.state.isLoading}
+        dismissDisabled={this.state.isLoading}
         disabled={this.state.isLoading}
         onDismissed={this.props.onDismissed}
         onSubmit={this.onFetch}
@@ -42,10 +42,10 @@ export class PushNeedsPullWarning extends React.Component<
       >
         <DialogContent>
           <p>
-            Desktop is unable to push commits to this branch because there are
-            commits on the remote that are not present on your local branch.
-            Fetch these new commits before pushing in order to reconcile them
-            with your local commits.
+            GitHub Desktop is unable to push commits to this branch because
+            there are commits on the remote that are not present on your local
+            branch. Fetch these new commits before pushing in order to reconcile
+            them with your local commits.
           </p>
         </DialogContent>
         <DialogFooter>

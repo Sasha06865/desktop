@@ -1,0 +1,23 @@
+{
+  "name": "printenvz",
+  "version": "1.0.0",
+  "description": "A native module that prints environment variables to stdout",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "install": "node-gyp rebuild",
+    "build": "node-gyp build",
+    "clean": "node-gyp clean",
+    "rebuild": "node-gyp rebuild"
+  },
+  "gypfile": true,
+  "dependencies": {
+    "node-gyp": "^12.1.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^12.1.0"
+  },
+  "keywords": ["native", "environment", "variables", "executable"],
+  "author": "",
+  "license": "MIT"
+}

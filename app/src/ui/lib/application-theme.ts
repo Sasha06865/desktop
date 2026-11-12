@@ -1,17 +1,21 @@
-import { remote } from 'electron'
 import {
   isMacOSMojaveOrLater,
   isWindows10And1809Preview17666OrLater,
 } from '../../lib/get-os'
 import { getBoolean } from '../../lib/local-storage'
+import {
+  setNativeThemeSource,
+  shouldUseDarkColors,
+} from '../main-process-proxy'
+import { ThemeSource } from './theme-source'
 
 /**
  * A set of the user-selectable appearances (aka themes)
  */
 export enum ApplicationTheme {
-  Light,
-  Dark,
-  System,
+  Light = 'light',
+  Dark = 'dark',
+  System = 'system',
 }
 
 export type ApplicableTheme = ApplicationTheme.Light | ApplicationTheme.Dark
@@ -21,9 +25,7 @@ export type ApplicableTheme = ApplicationTheme.Light | ApplicationTheme.Dark
  * in persisting to storage and/or calculating the required
  * body class name to set in order to apply the theme.
  */
-export function getThemeName(
-  theme: ApplicationTheme
-): 'light' | 'dark' | 'system' {
+export function getThemeName(theme: ApplicationTheme): ThemeSource {
   switch (theme) {
     case ApplicationTheme.Light:
       return 'light'
@@ -31,22 +33,6 @@ export function getThemeName(
       return 'dark'
     default:
       return 'system'
-  }
-}
-
-/**
- * Load the currently selected theme
- */
-export function getPersistedTheme(): ApplicationTheme {
-  const currentTheme = getPersistedThemeName()
-
-  switch (currentTheme) {
-    case 'light':
-      return ApplicationTheme.Light
-    case 'dark':
-      return ApplicationTheme.Dark
-    default:
-      return ApplicationTheme.System
   }
 }
 
@@ -81,39 +67,34 @@ const applicationThemeKey = 'theme'
 /**
  * Returns User's theme preference or 'system' if not set or parsable
  */
-function getApplicationThemeSetting(): 'light' | 'dark' | 'system' {
+function getApplicationThemeSetting(): ApplicationTheme {
   const themeSetting = localStorage.getItem(applicationThemeKey)
 
-  if (themeSetting === null) {
-    return 'system'
-  }
-
   if (
-    themeSetting === 'light' ||
-    themeSetting === 'dark' ||
-    themeSetting === 'system'
+    themeSetting === ApplicationTheme.Light ||
+    themeSetting === ApplicationTheme.Dark
   ) {
     return themeSetting
   }
 
-  return 'system'
+  return ApplicationTheme.System
 }
 
 /**
  * Load the name of the currently selected theme
  */
-export function getCurrentlyAppliedTheme(): ApplicableTheme {
-  return isDarkModeEnabled() ? ApplicationTheme.Dark : ApplicationTheme.Light
+export async function getCurrentlyAppliedTheme(): Promise<ApplicableTheme> {
+  return (await isDarkModeEnabled())
+    ? ApplicationTheme.Dark
+    : ApplicationTheme.Light
 }
 
 /**
  * Load the name of the currently selected theme
  */
-export function getPersistedThemeName(): string {
-  const setting = migrateAutomaticallySwitchSetting()
-
-  if (setting === 'system') {
-    return setting
+export function getPersistedThemeName(): ApplicationTheme {
+  if (migrateAutomaticallySwitchSetting() === 'system') {
+    return ApplicationTheme.System
   }
 
   return getApplicationThemeSetting()
@@ -124,8 +105,8 @@ export function getPersistedThemeName(): string {
  */
 export function setPersistedTheme(theme: ApplicationTheme): void {
   const themeName = getThemeName(theme)
-  localStorage.setItem(applicationThemeKey, themeName)
-  remote.nativeTheme.themeSource = themeName
+  localStorage.setItem(applicationThemeKey, theme)
+  setNativeThemeSource(themeName)
 }
 
 /**
@@ -139,11 +120,13 @@ export function supportsSystemThemeChanges(): boolean {
     // was released October 2nd, 2018 and the feature can just be "attained" by upgrading
     // See https://github.com/desktop/desktop/issues/9015 for more
     return isWindows10And1809Preview17666OrLater()
+  } else {
+    // enabling this for Linux users as an experiment to see if distributions
+    // work with how Chromium detects theme changes
+    return true
   }
-
-  return false
 }
 
-function isDarkModeEnabled(): boolean {
-  return remote.nativeTheme.shouldUseDarkColors
+function isDarkModeEnabled(): Promise<boolean> {
+  return shouldUseDarkColors()
 }

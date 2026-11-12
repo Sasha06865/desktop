@@ -9,8 +9,9 @@ import { OkCancelButtonGroup } from '../dialog/ok-cancel-button-group'
 import { Repository } from '../../models/repository'
 import { RetryAction, RetryActionType } from '../../models/retry-actions'
 import { Dispatcher } from '../dispatcher'
-import { assertNever } from '../../lib/fatal-error'
 import { PathText } from '../lib/path-text'
+import { assertNever } from '../../lib/fatal-error'
+import { PopupType } from '../../models/popup'
 
 interface ILocalChangesOverwrittenDialogProps {
   readonly repository: Repository
@@ -35,7 +36,7 @@ interface ILocalChangesOverwrittenDialogProps {
   readonly files: ReadonlyArray<string>
 }
 interface ILocalChangesOverwrittenDialogState {
-  readonly stashingAndRetrying: boolean
+  readonly stashing: boolean
 }
 
 export class LocalChangesOverwrittenDialog extends React.Component<
@@ -44,7 +45,7 @@ export class LocalChangesOverwrittenDialog extends React.Component<
 > {
   public constructor(props: ILocalChangesOverwrittenDialogProps) {
     super(props)
-    this.state = { stashingAndRetrying: false }
+    this.state = { stashing: false }
   }
 
   public render() {
@@ -57,19 +58,23 @@ export class LocalChangesOverwrittenDialog extends React.Component<
       <Dialog
         title="Error"
         id="local-changes-overwritten"
-        loading={this.state.stashingAndRetrying}
-        disabled={this.state.stashingAndRetrying}
-        onDismissed={this.props.onDismissed}
+        loading={this.state.stashing}
+        disabled={this.state.stashing}
+        onDismissed={this.onDismissPopup}
         onSubmit={this.onSubmit}
         type="error"
+        role="alertdialog"
+        ariaDescribedBy="local-changes-error-description"
       >
         <DialogContent>
-          <p>
-            Unable to {this.getRetryActionName()} when changes are present on
-            your branch.{overwrittenText}
-          </p>
-          {this.renderFiles()}
-          {this.renderStashText()}
+          <div id="local-changes-error-description">
+            <p>
+              Unable to {this.getRetryActionName()} when changes are present on
+              your branch.{overwrittenText}
+            </p>
+            {this.renderFiles()}
+            {this.renderStashText()}
+          </div>
         </DialogContent>
         {this.renderFooter()}
       </Dialog>
@@ -95,8 +100,16 @@ export class LocalChangesOverwrittenDialog extends React.Component<
     )
   }
 
+  private get canStashChanges() {
+    return (
+      !this.props.hasExistingStash &&
+      !this.state.stashing &&
+      this.props.retryAction.type !== RetryActionType.PopStash
+    )
+  }
+
   private renderStashText() {
-    if (this.props.hasExistingStash && !this.state.stashingAndRetrying) {
+    if (!this.canStashChanges) {
       return null
     }
 
@@ -104,7 +117,7 @@ export class LocalChangesOverwrittenDialog extends React.Component<
   }
 
   private renderFooter() {
-    if (this.props.hasExistingStash && !this.state.stashingAndRetrying) {
+    if (!this.canStashChanges) {
       return <DefaultDialogFooter />
     }
 
@@ -134,7 +147,7 @@ export class LocalChangesOverwrittenDialog extends React.Component<
       return
     }
 
-    this.setState({ stashingAndRetrying: true })
+    this.setState({ stashing: true })
 
     // We know that there's no stash for the current branch so we can safely
     // tell createStashForCurrentBranch not to show a confirmation dialog which
@@ -144,11 +157,25 @@ export class LocalChangesOverwrittenDialog extends React.Component<
       false
     )
 
+    this.props.onDismissed()
+
     if (createdStash) {
       await dispatcher.performRetry(retryAction)
     }
+  }
 
-    this.props.onDismissed()
+  /**
+   * on Dismiss, abort rebase if the retryAction is rebase, then call the onDismissed callback
+   */
+  private onDismissPopup = async () => {
+    const { dispatcher, retryAction, onDismissed } = this.props
+    // default dismiss handler , closes the popup via onPopupDismissedFn
+    onDismissed()
+
+    // Rebase flow is interrupted, user aborting due to unstashed changes, close outer multi commit operation popup
+    if (retryAction.type === RetryActionType.Rebase) {
+      dispatcher.closePopup(PopupType.MultiCommitOperation)
+    }
   }
 
   /**
@@ -173,6 +200,14 @@ export class LocalChangesOverwrittenDialog extends React.Component<
       case RetryActionType.CherryPick:
       case RetryActionType.CreateBranchForCherryPick:
         return 'cherry-pick'
+      case RetryActionType.Squash:
+        return 'squash'
+      case RetryActionType.Reorder:
+        return 'reorder'
+      case RetryActionType.DiscardChanges:
+        return 'discard changes'
+      case RetryActionType.PopStash:
+        return 'restore stashed changes'
       default:
         assertNever(
           this.props.retryAction,

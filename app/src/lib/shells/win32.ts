@@ -1,13 +1,23 @@
 import { spawn, ChildProcess } from 'child_process'
 import * as Path from 'path'
-import { enumerateValues, HKEY, RegistryValueType } from 'registry-js'
-import { pathExists } from 'fs-extra'
-
+import {
+  enumerateValues,
+  HKEY,
+  RegistryValue,
+  RegistryValueType,
+} from 'registry-js'
 import { assertNever } from '../fatal-error'
-import { IFoundShell } from './found-shell'
 import { enableWSLDetection } from '../feature-flag'
 import { findGitOnPath } from '../is-git-on-path'
 import { parseEnumValue } from '../enum'
+import { pathExists } from '../path-exists'
+import { FoundShell } from './shared'
+import {
+  expandTargetPathArgument,
+  ICustomIntegration,
+  parseCustomIntegrationArguments,
+  spawnCustomIntegration,
+} from '../custom-integration'
 
 export enum Shell {
   Cmd = 'Command Prompt',
@@ -17,8 +27,10 @@ export enum Shell {
   GitBash = 'Git Bash',
   Cygwin = 'Cygwin',
   WSL = 'WSL',
-  WindowTerminal = 'Windows Terminal',
+  WindowsTerminal = 'Windows Terminal',
+  FluentTerminal = 'Fluent Terminal',
   Alacritty = 'Alacritty',
+  Warp = 'Warp',
 }
 
 export const Default = Shell.Cmd
@@ -28,14 +40,16 @@ export function parse(label: string): Shell {
 }
 
 export async function getAvailableShells(): Promise<
-  ReadonlyArray<IFoundShell<Shell>>
+  ReadonlyArray<FoundShell<Shell>>
 > {
   const gitPath = await findGitOnPath()
-  const shells: IFoundShell<Shell>[] = [
+  const rootDir = process.env.WINDIR || 'C:\\Windows'
+  const dosKeyExePath = `"${rootDir}\\system32\\doskey.exe git=^"${gitPath}^" $*"`
+  const shells: FoundShell<Shell>[] = [
     {
       shell: Shell.Cmd,
       path: process.env.comspec || 'C:\\Windows\\System32\\cmd.exe',
-      extraArgs: gitPath ? ['/K', `"doskey git=^"${gitPath}^" $*"`] : [],
+      extraArgs: gitPath ? ['/K', dosKeyExePath] : [],
     },
   ]
 
@@ -79,6 +93,14 @@ export async function getAvailableShells(): Promise<
     })
   }
 
+  const warpPath = await findWarp()
+  if (warpPath != null) {
+    shells.push({
+      shell: Shell.Warp,
+      path: warpPath,
+    })
+  }
+
   if (enableWSLDetection()) {
     const wslPath = await findWSL()
     if (wslPath != null) {
@@ -100,8 +122,16 @@ export async function getAvailableShells(): Promise<
   const windowsTerminal = await findWindowsTerminal()
   if (windowsTerminal != null) {
     shells.push({
-      shell: Shell.WindowTerminal,
+      shell: Shell.WindowsTerminal,
       path: windowsTerminal,
+    })
+  }
+
+  const fluentTerminal = await findFluentTerminal()
+  if (fluentTerminal != null) {
+    shells.push({
+      shell: Shell.FluentTerminal,
+      path: fluentTerminal,
     })
   }
   return shells
@@ -211,7 +241,7 @@ async function findHyper(): Promise<string | null> {
   return null
 }
 
-async function findGitBash(): Promise<string | null> {
+export async function findGitBash(): Promise<string | null> {
   const registryPath = enumerateValues(
     HKEY.HKEY_LOCAL_MACHINE,
     'SOFTWARE\\GitForWindows'
@@ -275,6 +305,77 @@ async function findCygwin(): Promise<string | null> {
   }
 
   return null
+}
+
+async function findOldWarp(
+  warpRegistry: readonly RegistryValue[]
+): Promise<string | null> {
+  if (!warpRegistry || warpRegistry.length === 0) {
+    return null
+  }
+
+  const localAppData = process.env.LocalAppData
+  const programFiles = process.env.ProgramFiles
+  const programFilesx86 = process.env['ProgramFiles(x86)']
+
+  // If all environment variables are unset, return null
+  if (!localAppData && !programFiles && !programFilesx86) {
+    return null
+  }
+
+  const warpPathLocalAppData = localAppData
+    ? Path.join(localAppData, 'warp', 'Warp', 'warp.exe')
+    : null
+  const warpPathProgramFiles = programFiles
+    ? Path.join(programFiles, 'Warp', 'warp.exe')
+    : null
+  const warpPathProgramFilesx86 = programFilesx86
+    ? Path.join(programFilesx86, 'Warp', 'warp.exe')
+    : null
+
+  // If any of the paths exist, return it
+  if (warpPathLocalAppData && (await pathExists(warpPathLocalAppData))) {
+    return warpPathLocalAppData
+  } else if (warpPathProgramFiles && (await pathExists(warpPathProgramFiles))) {
+    return warpPathProgramFiles
+  } else if (
+    warpPathProgramFilesx86 &&
+    (await pathExists(warpPathProgramFilesx86))
+  ) {
+    return warpPathProgramFilesx86
+  } else {
+    log.debug(`[Warp] no installation path found, aborting fallback behavior`)
+  }
+
+  return null
+}
+
+async function findWarp(): Promise<string | null> {
+  const warpRegistry = enumerateValues(
+    HKEY.HKEY_CURRENT_USER,
+    'Software\\Warp.dev\\Warp' // Get warp installation path
+  )
+
+  if (!warpRegistry || warpRegistry.length === 0) {
+    return null
+  }
+
+  const warpInstallationPath = warpRegistry.find(
+    e => e.name === 'InstallationPath'
+  )
+  if (
+    !warpInstallationPath ||
+    warpInstallationPath.type !== RegistryValueType.REG_SZ
+  ) {
+    return await findOldWarp(warpRegistry)
+  }
+
+  // If any of the paths exist, return it
+  if (await pathExists(warpInstallationPath.data)) {
+    return warpInstallationPath.data
+  }
+
+  return await findOldWarp(warpRegistry)
 }
 
 async function findWSL(): Promise<string | null> {
@@ -361,8 +462,28 @@ async function findWindowsTerminal(): Promise<string | null> {
   return null
 }
 
+async function findFluentTerminal(): Promise<string | null> {
+  // Fluent Terminal has a link at
+  // C:\Users\<User>\AppData\Local\Microsoft\WindowsApps\flute.exe
+  const localAppData = process.env.LocalAppData
+  if (localAppData != null) {
+    const fluentTerminalpath = Path.join(
+      localAppData,
+      '\\Microsoft\\WindowsApps\\flute.exe'
+    )
+    if (await pathExists(fluentTerminalpath)) {
+      return fluentTerminalpath
+    } else {
+      log.debug(
+        `[Fluent Terminal] flute.exe doest not exist at '${fluentTerminalpath}'`
+      )
+    }
+  }
+  return null
+}
+
 export function launch(
-  foundShell: IFoundShell<Shell>,
+  foundShell: FoundShell<Shell>,
   path: string
 ): ChildProcess {
   const shell = foundShell.shell
@@ -409,16 +530,29 @@ export function launch(
         cwd: path,
       })
     case Shell.Cygwin:
-      const cygwinPath = `"${foundShell.path}"`
+      const cygwinPath = foundShell.path
       log.info(`launching ${shell} at path: ${cygwinPath}`)
+      // Pass the path through the environment so shell metacharacters in
+      // directory names remain literal instead of becoming part of the script.
       return spawn(
         cygwinPath,
-        [`/bin/sh -lc 'cd "$(cygpath "${path}")"; exec bash`],
+        [
+          '/bin/sh',
+          '-lc',
+          'cd -- "$(cygpath -- "$GITHUB_DESKTOP_CYGWIN_OPEN_PATH")" && exec bash',
+        ],
         {
-          shell: true,
           cwd: path,
+          env: { ...process.env, GITHUB_DESKTOP_CYGWIN_OPEN_PATH: path },
         }
       )
+    case Shell.Warp:
+      const warpPath = `"${foundShell.path}"`
+      log.info(`launching ${shell} at path: ${warpPath}`)
+      return spawn(warpPath, [`warp://action/new_tab?path="${path}"`], {
+        shell: true,
+        cwd: path,
+      })
     case Shell.WSL:
       return spawn('START', ['"WSL"', `"${foundShell.path}"`], {
         shell: true,
@@ -433,11 +567,27 @@ export function launch(
           cwd: path,
         }
       )
-    case Shell.WindowTerminal:
+    case Shell.WindowsTerminal:
       const windowsTerminalPath = `"${foundShell.path}"`
       log.info(`launching ${shell} at path: ${windowsTerminalPath}`)
       return spawn(windowsTerminalPath, ['-d .'], { shell: true, cwd: path })
+    case Shell.FluentTerminal:
+      const fluentTerminalPath = `"${foundShell.path}"`
+      log.info(`launching ${shell} at path: ${fluentTerminalPath}`)
+      return spawn(fluentTerminalPath, ['new'], { shell: true, cwd: path })
     default:
       return assertNever(shell, `Unknown shell: ${shell}`)
   }
+}
+
+export function launchCustomShell(
+  customShell: ICustomIntegration,
+  path: string
+): ChildProcess {
+  log.info(`launching custom shell at path: ${customShell.path}`)
+  const argv = parseCustomIntegrationArguments(customShell.arguments)
+  const args = expandTargetPathArgument(argv, path)
+  return spawnCustomIntegration(customShell.path, args, {
+    cwd: path,
+  })
 }

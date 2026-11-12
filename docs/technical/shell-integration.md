@@ -32,6 +32,7 @@ These shells are currently supported:
  - [WSL](https://docs.microsoft.com/en-us/windows/wsl/about) (beta)
  - [Windows Terminal](https://github.com/microsoft/terminal)
  - [Alacritty](https://github.com/alacritty/alacritty)
+ - [Fluent Terminal](https://github.com/felixse/FluentTerminal)
 
 These are defined in an enum at the top of the file:
 
@@ -44,7 +45,7 @@ export enum Shell {
   GitBash = 'Git Bash',
   Cygwin = 'Cygwin',
   WSL = 'WSL',
-  WindowTerminal = 'Windows Terminal',
+  WindowsTerminal = 'Windows Terminal',
   Alacritty = 'Alacritty',
 }
 ```
@@ -148,6 +149,9 @@ These shells are currently supported:
  - [PowerShell Core](https://github.com/powershell/powershell/)
  - [Kitty](https://sw.kovidgoyal.net/kitty/)
  - [Alacritty](https://github.com/alacritty/alacritty)
+ - [Tabby](https://tabby.sh/)
+ - [WezTerm](https://github.com/wez/wezterm)
+ - [Ghostty](https://ghostty.org/)
 
 These are defined in an enum at the top of the file:
 
@@ -169,13 +173,13 @@ use Hyper as a reference to explain the rest of the process.
 
 ### Step 1: Find the shell application
 
-The `getBundleID()` function is used to map a shell enum to it's bundle ID
-that is defined in it's manifest. You should add a new entry here for your
-shell.
+The `getBundleIDs()` function is used to map a shell enum to the possible bundle IDs
+that are defined in its manifest. You should add a new entry here for your
+shell. An array is returned to handle the case where a shell updates its bundle ID.
 
 ```ts
 case Shell.Hyper:
-  return 'co.zeit.hyper'
+  return ['co.zeit.hyper']
 ```
 
 After that, follow the existing patterns in `getAvailableShells()` and add a
@@ -183,44 +187,33 @@ new entry to lookup the install path for your shell.
 
 ```ts
 export async function getAvailableShells(): Promise<
-  ReadonlyArray<IFoundShell<Shell>>
+  ReadonlyArray<FoundShell<Shell>>
 > {
   const [
-    terminalPath,
-    hyperPath,
-    iTermPath,
-    powerShellCorePath,
-    kittyPath,
+    terminalInfo,
+    hyperInfo,
+    iTermInfo,
+    powerShellCoreInfo,
+    kittyInfo,
   ] = await Promise.all([
-    getShellPath(Shell.Terminal),
-    getShellPath(Shell.Hyper),
-    getShellPath(Shell.iTerm2),
-    getShellPath(Shell.PowerShellCore),
-    getShellPath(Shell.Kitty),
+    getShellInfo(Shell.Terminal),
+    getShellInfo(Shell.Hyper),
+    getShellInfo(Shell.iTerm2),
+    getShellInfo(Shell.PowerShellCore),
+    getShellInfo(Shell.Kitty),
   ])
 
   // other code
 
-  if (hyperPath) {
-    shells.push({ shell: Shell.Hyper, path: hyperPath })
+  if (hyperInfo) {
+    shells.push({ shell: Shell.Hyper, ...hyperInfo })
   }
 
   // other code
 }
 ```
 
-### Step 2: Parse the shell
-
-The `parse()` function is used to parse shell names. You should add a new entry here for your
-shell.
-
-```ts
-if (label === Shell.Hyper) {
-  return Shell.Hyper
-}
-```
-
-### Step 3: Launch the shell
+### Step 2: Launch the shell
 
 The launch step will use the `open` command in macOS to launch a given bundle
 at the path requested by the user. You may not need to make changes here,
@@ -228,12 +221,10 @@ unless your shell behaviour differs significantly from this.
 
 ```ts
 export function launch(
-  foundShell: IFoundShell<Shell>,
+  foundShell: FoundShell<Shell>,
   path: string
 ): ChildProcess {
-  const bundleID = getBundleID(foundShell.shell)
-  const commandArgs = ['-b', bundleID, path]
-  return spawn('open', commandArgs)
+  return spawn('open', ['-b', foundShell.bundleID, path])
 }
 ```
 
@@ -244,6 +235,7 @@ The source for the Linux shell integration is found in [`app/src/lib/shells/linu
 These shells are currently supported:
 
  - [GNOME Terminal](https://help.gnome.org/users/gnome-terminal/stable/)
+ - [Ptyxis](https://gitlab.gnome.org/chergert/ptyxis/)
  - [MATE Terminal](https://github.com/mate-desktop/mate-terminal)
  - [Tilix](https://github.com/gnunn1/tilix)
  - [Terminator](https://gnometerminator.blogspot.com)
@@ -251,6 +243,7 @@ These shells are currently supported:
  - [Konsole](https://konsole.kde.org/)
  - [XTerm](http://invisible-island.net/xterm/)
  - [Terminology](https://www.enlightenment.org/docs/apps/terminology.md)
+ - [Ghostty](https://ghostty.org/)
 
 These are defined in an enum at the top of the file:
 
@@ -287,7 +280,7 @@ new entry to lookup the install path for your shell.
 
 ```ts
 export async function getAvailableShells(): Promise<
-  ReadonlyArray<IFoundShell<Shell>>
+  ReadonlyArray<FoundShell<Shell>>
 > {
   const [
     gnomeTerminalPath,
@@ -325,7 +318,7 @@ the correct arguments are passed to the command line interface:
 
 ```ts
 export function launch(
-  foundShell: IFoundShell<Shell>,
+  foundShell: FoundShell<Shell>,
   path: string
 ): ChildProcess {
   const shell = foundShell.shell

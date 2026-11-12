@@ -2,8 +2,10 @@ import * as React from 'react'
 
 import { sanitizedRefName } from '../../lib/sanitize-ref-name'
 import { TextBox } from './text-box'
-import { Octicon, OcticonSymbol } from '../octicons'
 import { Ref } from './ref'
+import { InputWarning } from './input-description/input-warning'
+import { InputError } from './input-description/input-error'
+import { AutocompletingInput, IAutocompletionProvider } from '../autocompletion'
 
 interface IRefNameProps {
   /**
@@ -19,6 +21,16 @@ interface IRefNameProps {
   readonly label?: string | JSX.Element
 
   /**
+   * The aria-labelledBy attribute for the text box.
+   */
+  readonly ariaLabelledBy?: string
+
+  /**
+   * The aria-describedby attribute for the text box.
+   */
+  readonly ariaDescribedBy?: string
+
+  /**
    * Called when the user changes the ref name.
    *
    * A sanitized value for the ref name is passed.
@@ -26,16 +38,12 @@ interface IRefNameProps {
   readonly onValueChange?: (sanitizedValue: string) => void
 
   /**
-   * Called when the user-entered ref name is not valid.
+   * Optional verb for the warning message.
    *
-   * This gives the opportunity to the caller to specify
-   * a custom warning message explaining that the sanitized
-   * value will be used instead.
+   * Warning message: Will be {this.props.warningMessageVerb ?? 'saved '} as{'
+   * '} <Ref>{sanitizedValue}</Ref>.
    */
-  readonly renderWarningMessage?: (
-    sanitizedValue: string,
-    proposedValue: string
-  ) => JSX.Element | string
+  readonly warningMessageVerb?: string
 
   /**
    * Callback used when the component loses focus.
@@ -43,6 +51,18 @@ interface IRefNameProps {
    * A sanitized value for the ref name is passed.
    */
   readonly onBlur?: (sanitizedValue: string) => void
+
+  /**
+   * Optional autocompletion provider. When provided, the text input will use
+   * AutocompletingInput with alwaysAutocomplete enabled instead of a plain
+   * TextBox.
+   */
+  readonly autocompletionProvider?: IAutocompletionProvider<object>
+
+  /**
+   * Optional placeholder text shown when the input is empty.
+   */
+  readonly placeholder?: string
 }
 
 interface IRefNameState {
@@ -55,13 +75,17 @@ export class RefNameTextBox extends React.Component<
   IRefNameState
 > {
   private textBoxRef = React.createRef<TextBox>()
+  private autocompletingInputRef =
+    React.createRef<AutocompletingInput<object>>()
 
   public constructor(props: IRefNameProps) {
     super(props)
+    this.state = this.getStateForInitialValue(props.initialValue)
+  }
 
-    const proposedValue = props.initialValue || ''
-
-    this.state = {
+  private getStateForInitialValue(initialValue?: string): IRefNameState {
+    const proposedValue = initialValue || ''
+    return {
       proposedValue,
       sanitizedValue: sanitizedRefName(proposedValue),
     }
@@ -76,19 +100,61 @@ export class RefNameTextBox extends React.Component<
     }
   }
 
+  public componentWillReceiveProps(nextProps: IRefNameProps): void {
+    if (
+      nextProps.initialValue !== this.props.initialValue &&
+      this.state.sanitizedValue === ''
+    ) {
+      this.setState(this.getStateForInitialValue(nextProps.initialValue))
+    }
+  }
+
   public render() {
     return (
       <div className="ref-name-text-box">
-        <TextBox
+        {this.renderTextInput()}
+        {this.renderRefValueWarningError()}
+      </div>
+    )
+  }
+
+  private renderTextInput() {
+    const ariaDescribedBy =
+      (this.props.ariaDescribedBy ?? '') +
+      ` branch-name-warning` +
+      ` branch-name-error`
+
+    if (this.props.autocompletionProvider !== undefined) {
+      return (
+        <AutocompletingInput
+          ref={this.autocompletingInputRef}
           label={this.props.label}
+          placeholder={this.props.placeholder}
           value={this.state.proposedValue}
-          ref={this.textBoxRef}
+          ariaLabelledBy={this.props.ariaLabelledBy}
+          ariaDescribedBy={ariaDescribedBy}
+          autocompletionProviders={[this.props.autocompletionProvider]}
+          alwaysAutocomplete={this.state.proposedValue.length === 0}
           onValueChanged={this.onValueChange}
           onBlur={this.onBlur}
+          completionSuffix=""
+          anchorToCaret={false}
+          anchorOffset={4}
         />
+      )
+    }
 
-        {this.renderRefValueWarning()}
-      </div>
+    return (
+      <TextBox
+        label={this.props.label}
+        placeholder={this.props.placeholder}
+        value={this.state.proposedValue}
+        ref={this.textBoxRef}
+        ariaLabelledBy={this.props.ariaLabelledBy}
+        ariaDescribedBy={ariaDescribedBy}
+        onValueChanged={this.onValueChange}
+        onBlur={this.onBlur}
+      />
     )
   }
 
@@ -97,7 +163,9 @@ export class RefNameTextBox extends React.Component<
    * (i.e. if it's not disabled explicitly or implicitly through for example a fieldset).
    */
   public focus() {
-    if (this.textBoxRef.current !== null) {
+    if (this.autocompletingInputRef.current !== null) {
+      this.autocompletingInputRef.current.focus()
+    } else if (this.textBoxRef.current !== null) {
       this.textBoxRef.current.focus()
     }
   }
@@ -129,43 +197,55 @@ export class RefNameTextBox extends React.Component<
     }
   }
 
-  private renderRefValueWarning() {
+  private renderRefValueWarningError() {
     const { proposedValue, sanitizedValue } = this.state
 
     if (proposedValue === sanitizedValue) {
       return null
     }
 
-    const renderWarningMessage =
-      this.props.renderWarningMessage ?? this.defaultRenderWarningMessage
-
-    return (
-      <div className="warning-helper-text">
-        <Octicon symbol={OcticonSymbol.alert} />
-
-        <p>{renderWarningMessage(sanitizedValue, proposedValue)}</p>
-      </div>
-    )
-  }
-
-  private defaultRenderWarningMessage(
-    sanitizedValue: string,
-    proposedValue: string
-  ) {
     // If the proposed value ends up being sanitized as
     // an empty string we show a message saying that the
     // proposed value is invalid.
     if (sanitizedValue.length === 0) {
       return (
-        <>
+        <InputError
+          id="branch-name-error"
+          className="warning-helper-text"
+          trackedUserInput={proposedValue}
+          ariaLiveMessage={`Error: ${proposedValue} is not a valid name.`}
+        >
           <Ref>{proposedValue}</Ref> is not a valid name.
-        </>
+        </InputError>
       )
     }
 
     return (
+      <InputWarning
+        id="branch-name-warning"
+        className="warning-helper-text"
+        trackedUserInput={proposedValue}
+        ariaLiveMessage={this.getWarningMessageAsString(sanitizedValue)}
+      >
+        <p>{this.renderWarningMessage(sanitizedValue)}</p>
+      </InputWarning>
+    )
+  }
+
+  private getWarningMessageAsString(sanitizedValue: string): string {
+    return `Warning: Will be ${
+      this.props.warningMessageVerb ?? 'created '
+    } as ${sanitizedValue}. Spaces and invalid characters have been replaced by hyphens.`
+  }
+
+  private renderWarningMessage(sanitizedValue: string) {
+    return (
       <>
-        Will be created as <Ref>{sanitizedValue}</Ref>.
+        Will be {this.props.warningMessageVerb ?? 'created'} as{' '}
+        <Ref>{sanitizedValue}</Ref>.{' '}
+        <span className="sr-only">
+          Spaces and invalid characters have been replaced by hyphens.
+        </span>
       </>
     )
   }

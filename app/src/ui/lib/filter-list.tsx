@@ -12,6 +12,7 @@ import { TextBox } from '../lib/text-box'
 import { Row } from '../lib/row'
 
 import { match, IMatch, IMatches } from '../../lib/fuzzy-find'
+import { AriaLiveContainer } from '../accessibility/aria-live-container'
 
 /** An item in the filter list. */
 export interface IFilterListItem {
@@ -23,17 +24,23 @@ export interface IFilterListItem {
 }
 
 /** A group of items in the list. */
-export interface IFilterListGroup<T extends IFilterListItem> {
+export interface IFilterListGroup<
+  Item extends IFilterListItem,
+  Identifier = string
+> {
   /** The identifier for this group. */
-  readonly identifier: string
+  readonly identifier: Identifier
+
+  /** Whether to render this group's header. Defaults to true. */
+  readonly showHeader?: boolean
 
   /** The items in the group. */
-  readonly items: ReadonlyArray<T>
+  readonly items: ReadonlyArray<Item>
 }
 
-interface IFlattenedGroup {
+interface IFlattenedGroup<T> {
   readonly kind: 'group'
-  readonly identifier: string
+  readonly identifier: T
 }
 
 interface IFlattenedItem<T extends IFilterListItem> {
@@ -47,11 +54,11 @@ interface IFlattenedItem<T extends IFilterListItem> {
  * A row in the list. This is used internally after the user-provided groups are
  * flattened.
  */
-type IFilterListRow<T extends IFilterListItem> =
-  | IFlattenedGroup
+type IFilterListRow<T extends IFilterListItem, GroupIdentifier> =
+  | IFlattenedGroup<GroupIdentifier>
   | IFlattenedItem<T>
 
-interface IFilterListProps<T extends IFilterListItem> {
+interface IFilterListProps<T extends IFilterListItem, GroupIdentifier> {
   /** A class name for the wrapping element. */
   readonly className?: string
 
@@ -59,7 +66,8 @@ interface IFilterListProps<T extends IFilterListItem> {
   readonly rowHeight: number
 
   /** The ordered groups to display in the list. */
-  readonly groups: ReadonlyArray<IFilterListGroup<T>>
+  // eslint-disable-next-line react/no-unused-prop-types
+  readonly groups: ReadonlyArray<IFilterListGroup<T, GroupIdentifier>>
 
   /** The selected item. */
   readonly selectedItem: T | null
@@ -68,7 +76,9 @@ interface IFilterListProps<T extends IFilterListItem> {
   readonly renderItem: (item: T, matches: IMatches) => JSX.Element | null
 
   /** Called to render header for the group with the given identifier. */
-  readonly renderGroupHeader?: (identifier: string) => JSX.Element | null
+  readonly renderGroupHeader?: (
+    identifier: GroupIdentifier
+  ) => JSX.Element | null
 
   /** Called to render content before/above the filter and list. */
   readonly renderPreList?: () => JSX.Element | null
@@ -112,6 +122,9 @@ interface IFilterListProps<T extends IFilterListItem> {
     event: React.KeyboardEvent<HTMLInputElement>
   ) => void
 
+  /** Called when the Enter key is pressed in field of type search */
+  readonly onEnterPressedWithoutFilteredItems?: (text: string) => void
+
   /** The current filter text to use in the form */
   readonly filterText?: string
 
@@ -151,11 +164,25 @@ interface IFilterListProps<T extends IFilterListItem> {
 
   /** If true, we do not render the filter. */
   readonly hideFilterRow?: boolean
+
+  /**
+   * A handler called whenever a context menu event is received on the
+   * row container element.
+   *
+   * The context menu is invoked when a user right clicks the row or
+   * uses keyboard shortcut.s
+   */
+  readonly onItemContextMenu?: (
+    item: T,
+    event: React.MouseEvent<HTMLDivElement>
+  ) => void
 }
 
-interface IFilterListState<T extends IFilterListItem> {
-  readonly rows: ReadonlyArray<IFilterListRow<T>>
+interface IFilterListState<T extends IFilterListItem, GroupIdentifier> {
+  readonly rows: ReadonlyArray<IFilterListRow<T, GroupIdentifier>>
   readonly selectedRow: number
+  readonly filterValue: string
+  readonly filterValueChanged: boolean
 }
 
 /**
@@ -172,32 +199,35 @@ export interface IFilterSelectionSource {
 export type SelectionSource = ListSelectionSource | IFilterSelectionSource
 
 /** A List which includes the ability to filter based on its contents. */
-export class FilterList<T extends IFilterListItem> extends React.Component<
-  IFilterListProps<T>,
-  IFilterListState<T>
+export class FilterList<
+  T extends IFilterListItem,
+  GroupIdentifier = string
+> extends React.Component<
+  IFilterListProps<T, GroupIdentifier>,
+  IFilterListState<T, GroupIdentifier>
 > {
   private list: List | null = null
   private filterTextBox: TextBox | null = null
 
-  public constructor(props: IFilterListProps<T>) {
+  public constructor(props: IFilterListProps<T, GroupIdentifier>) {
     super(props)
 
-    this.state = createStateUpdate(props)
-  }
-
-  public componentWillMount() {
-    if (this.props.filterTextBox !== undefined) {
-      this.filterTextBox = this.props.filterTextBox
+    if (props.filterTextBox !== undefined) {
+      this.filterTextBox = props.filterTextBox
     }
+
+    this.state = createStateUpdate(props, null)
   }
 
-  public componentWillReceiveProps(nextProps: IFilterListProps<T>) {
-    this.setState(createStateUpdate(nextProps))
+  public componentWillReceiveProps(
+    nextProps: IFilterListProps<T, GroupIdentifier>
+  ) {
+    this.setState(createStateUpdate(nextProps, this.state))
   }
 
   public componentDidUpdate(
-    prevProps: IFilterListProps<T>,
-    prevState: IFilterListState<T>
+    prevProps: IFilterListProps<T, GroupIdentifier>,
+    prevState: IFilterListState<T, GroupIdentifier>
   ) {
     if (this.props.onSelectionChanged) {
       const oldSelectedItemId = getItemIdFromRowIndex(
@@ -228,8 +258,9 @@ export class FilterList<T extends IFilterListItem> extends React.Component<
     }
 
     if (this.props.onFilterListResultsChanged !== undefined) {
-      const itemCount = this.state.rows.filter(row => row.kind === 'item')
-        .length
+      const itemCount = this.state.rows.filter(
+        row => row.kind === 'item'
+      ).length
 
       this.props.onFilterListResultsChanged(itemCount)
     }
@@ -245,14 +276,32 @@ export class FilterList<T extends IFilterListItem> extends React.Component<
     return (
       <TextBox
         ref={this.onTextBoxRef}
-        type="search"
+        displayClearButton={true}
         autoFocus={true}
         placeholder={this.props.placeholderText || 'Filter'}
         className="filter-list-filter-field"
         onValueChanged={this.onFilterValueChanged}
+        onEnterPressed={this.onEnterPressed}
         onKeyDown={this.onKeyDown}
         value={this.props.filterText}
         disabled={this.props.disabled}
+      />
+    )
+  }
+
+  public renderLiveContainer() {
+    if (!this.state.filterValueChanged) {
+      return null
+    }
+
+    const itemRows = this.state.rows.filter(row => row.kind === 'item')
+    const resultsPluralized = itemRows.length === 1 ? 'result' : 'results'
+    const screenReaderMessage = `${itemRows.length} ${resultsPluralized}`
+
+    return (
+      <AriaLiveContainer
+        message={screenReaderMessage}
+        trackedUserInput={this.state.filterValue}
       />
     )
   }
@@ -273,6 +322,8 @@ export class FilterList<T extends IFilterListItem> extends React.Component<
   public render() {
     return (
       <div className={classnames('filter-list', this.props.className)}>
+        {this.renderLiveContainer()}
+
         {this.props.renderPreList ? this.props.renderPreList() : null}
 
         {this.renderFilterRow()}
@@ -333,10 +384,13 @@ export class FilterList<T extends IFilterListItem> extends React.Component<
           rowCount={this.state.rows.length}
           rowRenderer={this.renderRow}
           rowHeight={this.props.rowHeight}
-          selectedRows={[this.state.selectedRow]}
+          selectedRows={
+            this.state.selectedRow === -1 ? [] : [this.state.selectedRow]
+          }
           onSelectedRowChanged={this.onSelectedRowChanged}
           onRowClick={this.onRowClick}
           onRowKeyDown={this.onRowKeyDown}
+          onRowContextMenu={this.onRowContextMenu}
           canSelectRow={this.canSelectRow}
           invalidationProps={{
             ...this.props,
@@ -372,6 +426,17 @@ export class FilterList<T extends IFilterListItem> extends React.Component<
     }
   }
 
+  private onEnterPressed = (text: string) => {
+    const rows = this.state.rows.length
+    if (
+      rows === 0 &&
+      text.trim().length > 0 &&
+      this.props.onEnterPressedWithoutFilteredItems !== undefined
+    ) {
+      this.props.onEnterPressedWithoutFilteredItems(text)
+    }
+  }
+
   private onSelectedRowChanged = (index: number, source: SelectionSource) => {
     this.setState({ selectedRow: index })
 
@@ -400,6 +465,23 @@ export class FilterList<T extends IFilterListItem> extends React.Component<
         this.props.onItemClick(row.item, source)
       }
     }
+  }
+
+  private onRowContextMenu = (
+    index: number,
+    source: React.MouseEvent<HTMLDivElement>
+  ) => {
+    if (!this.props.onItemContextMenu) {
+      return
+    }
+
+    const row = this.state.rows[index]
+
+    if (row.kind !== 'item') {
+      return
+    }
+
+    this.props.onItemContextMenu(row.item, source)
   }
 
   private onRowKeyDown = (row: number, event: React.KeyboardEvent<any>) => {
@@ -518,10 +600,11 @@ export function getText<T extends IFilterListItem>(
   return item['text']
 }
 
-function createStateUpdate<T extends IFilterListItem>(
-  props: IFilterListProps<T>
+function createStateUpdate<T extends IFilterListItem, GroupIdentifier>(
+  props: IFilterListProps<T, GroupIdentifier>,
+  state: IFilterListState<T, GroupIdentifier> | null
 ) {
-  const flattenedRows = new Array<IFilterListRow<T>>()
+  const flattenedRows = new Array<IFilterListRow<T, GroupIdentifier>>()
   const filter = (props.filterText || '').toLowerCase()
 
   for (const group of props.groups) {
@@ -537,7 +620,7 @@ function createStateUpdate<T extends IFilterListItem>(
       continue
     }
 
-    if (props.renderGroupHeader) {
+    if (props.renderGroupHeader && group.showHeader !== false) {
       flattenedRows.push({ kind: 'group', identifier: group.identifier })
     }
 
@@ -560,11 +643,21 @@ function createStateUpdate<T extends IFilterListItem>(
     selectedRow = flattenedRows.findIndex(i => i.kind === 'item')
   }
 
-  return { rows: flattenedRows, selectedRow }
+  // Stay true if already set, otherwise become true if the filter has content
+  const filterValueChanged = state?.filterValueChanged
+    ? true
+    : filter.length > 0
+
+  return {
+    rows: flattenedRows,
+    selectedRow,
+    filterValue: filter,
+    filterValueChanged,
+  }
 }
 
-function getItemFromRowIndex<T extends IFilterListItem>(
-  items: ReadonlyArray<IFilterListRow<T>>,
+function getItemFromRowIndex<T extends IFilterListItem, GroupIdentifier>(
+  items: ReadonlyArray<IFilterListRow<T, GroupIdentifier>>,
   index: number
 ): T | null {
   if (index >= 0 && index < items.length) {
@@ -578,8 +671,8 @@ function getItemFromRowIndex<T extends IFilterListItem>(
   return null
 }
 
-function getItemIdFromRowIndex<T extends IFilterListItem>(
-  items: ReadonlyArray<IFilterListRow<T>>,
+function getItemIdFromRowIndex<T extends IFilterListItem, GroupIdentifier>(
+  items: ReadonlyArray<IFilterListRow<T, GroupIdentifier>>,
   index: number
 ): string | null {
   const item = getItemFromRowIndex(items, index)

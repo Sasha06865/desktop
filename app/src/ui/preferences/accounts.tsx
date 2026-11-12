@@ -1,17 +1,21 @@
 import * as React from 'react'
-import { Account } from '../../models/account'
+import {
+  Account,
+  isDotComAccount,
+  isEnterpriseAccount,
+} from '../../models/account'
 import { IAvatarUser } from '../../models/avatar'
 import { lookupPreferredEmail } from '../../lib/email'
 import { assertNever } from '../../lib/fatal-error'
 import { Button } from '../lib/button'
 import { Row } from '../lib/row'
-import { DialogContent } from '../dialog'
+import { DialogContent, DialogPreferredFocusClassName } from '../dialog'
 import { Avatar } from '../lib/avatar'
 import { CallToAction } from '../lib/call-to-action'
+import { groupAccountsByHost } from '../../lib/group-accounts-by-host'
 
 interface IAccountsProps {
-  readonly dotComAccount: Account | null
-  readonly enterpriseAccount: Account | null
+  readonly accounts: ReadonlyArray<Account>
 
   readonly onDotComSignIn: () => void
   readonly onEnterpriseSignIn: () => void
@@ -25,22 +29,65 @@ enum SignInType {
 
 export class Accounts extends React.Component<IAccountsProps, {}> {
   public render() {
+    const { accounts } = this.props
+    const dotComAccounts = accounts.filter(isDotComAccount)
+
     return (
       <DialogContent className="accounts-tab">
-        <h2>GitHub.com</h2>
-        {this.props.dotComAccount
-          ? this.renderAccount(this.props.dotComAccount)
-          : this.renderSignIn(SignInType.DotCom)}
+        <div className="accounts-section">
+          <h2>GitHub.com</h2>
+          {dotComAccounts.map(account =>
+            this.renderAccount(account, SignInType.DotCom)
+          )}
+          {dotComAccounts.length === 0 ? (
+            this.renderSignIn(SignInType.DotCom)
+          ) : (
+            <Button onClick={this.props.onDotComSignIn}>
+              Add GitHub.com account
+            </Button>
+          )}
+        </div>
 
-        <h2>GitHub Enterprise</h2>
-        {this.props.enterpriseAccount
-          ? this.renderAccount(this.props.enterpriseAccount)
-          : this.renderSignIn(SignInType.Enterprise)}
+        <div className="accounts-section">
+          <h2>GitHub Enterprise</h2>
+          {this.renderMultipleEnterpriseAccounts()}
+        </div>
       </DialogContent>
     )
   }
 
-  private renderAccount(account: Account) {
+  private renderMultipleEnterpriseAccounts() {
+    const enterpriseAccounts = this.props.accounts.filter(isEnterpriseAccount)
+
+    if (enterpriseAccounts.length === 0) {
+      return this.renderSignIn(SignInType.Enterprise)
+    }
+
+    return (
+      <>
+        {groupAccountsByHost(enterpriseAccounts).map(([host, accounts]) => {
+          const headingId = `enterprise-accounts-${host}`
+          return (
+            <section
+              key={host}
+              className="enterprise-host"
+              aria-labelledby={headingId}
+            >
+              <h3 id={headingId}>{host}</h3>
+              {accounts.map(account =>
+                this.renderAccount(account, SignInType.Enterprise)
+              )}
+            </section>
+          )
+        })}
+        <Button onClick={this.props.onEnterpriseSignIn}>
+          Add GitHub Enterprise account
+        </Button>
+      </>
+    )
+  }
+
+  private renderAccount(account: Account, type: SignInType) {
     const avatarUser: IAvatarUser = {
       name: account.name,
       email: lookupPreferredEmail(account),
@@ -48,14 +95,27 @@ export class Accounts extends React.Component<IAccountsProps, {}> {
       endpoint: account.endpoint,
     }
 
+    // The DotCom account is shown first, so its sign in/out button should be
+    // focused initially when the dialog is opened.
+    const className =
+      type === SignInType.DotCom ? DialogPreferredFocusClassName : undefined
+
     return (
-      <Row className="account-info">
-        <Avatar user={avatarUser} />
-        <div className="user-info">
-          <div className="name">{account.name}</div>
-          <div className="login">@{account.login}</div>
+      <Row
+        key={JSON.stringify([
+          account.endpoint.toLowerCase(),
+          account.login.toLowerCase(),
+        ])}
+        className="account-info"
+      >
+        <div className="user-info-container">
+          <Avatar accounts={this.props.accounts} user={avatarUser} />
+          <div className="user-info">
+            <div className="name">{account.name}</div>
+            <div className="login">@{account.login}</div>
+          </div>
         </div>
-        <Button onClick={this.logout(account)}>
+        <Button onClick={this.logout(account)} className={className}>
           {__DARWIN__ ? 'Sign Out' : 'Sign out'}
         </Button>
       </Row>
@@ -71,13 +131,16 @@ export class Accounts extends React.Component<IAccountsProps, {}> {
   }
 
   private renderSignIn(type: SignInType) {
-    const signInTitle = __DARWIN__ ? 'Sign In' : 'Sign in'
+    const signInTitle = __DARWIN__ ? 'Sign Into' : 'Sign into'
     switch (type) {
       case SignInType.DotCom: {
         return (
           <CallToAction
-            actionTitle={signInTitle}
+            actionTitle={signInTitle + ' GitHub.com'}
             onAction={this.onDotComSignIn}
+            // The DotCom account is shown first, so its sign in/out button should be
+            // focused initially when the dialog is opened.
+            buttonClassName={DialogPreferredFocusClassName}
           >
             <div>
               Sign in to your GitHub.com account to access your repositories.
@@ -88,12 +151,12 @@ export class Accounts extends React.Component<IAccountsProps, {}> {
       case SignInType.Enterprise:
         return (
           <CallToAction
-            actionTitle={signInTitle}
+            actionTitle={signInTitle + ' GitHub Enterprise'}
             onAction={this.onEnterpriseSignIn}
           >
             <div>
-              If you have a GitHub Enterprise or AE account at work, sign in to
-              it to get access to your repositories.
+              If you are using GitHub Enterprise at work, sign in to it to get
+              access to your repositories.
             </div>
           </CallToAction>
         )

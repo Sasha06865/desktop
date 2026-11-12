@@ -21,8 +21,6 @@ Other important folders:
 
  - `fixtures` - this folder contains Git repositories which can be used in tests
  - `helpers` - modules containing logic to help setup, manage and teardown tests
- - `__mocks__` - this is a special Jest folder that contains mocks for Electron
-   APIs, which are only stubbed out when tests require it
 
 ## Adding Unit Tests
 
@@ -49,8 +47,8 @@ describe('module being tested', () => {
 })
 ```
 
-If you run `yarn test:unit` from a shell you should see this error, which
-indicates the file is loaded into our Jest runner successfully.
+If you run `npm run test:unit` from a shell you should see this error, which
+indicates the file is loaded into our test runner successfully.
 
 Once you're happy that the test is being run, feel free to write some proper
 tests to exercise your work.
@@ -69,7 +67,7 @@ but here are some guidelines to help you figure out what to test.
  - if you're not confident in writing tests, the [Arrange-Act-Assert](http://wiki.c2.com/?ArrangeActAssert)
    pattern is a nice way to get started
 
-As you're writing your tests, don't forget to `yarn test:unit` to verify that
+As you're writing your tests, don't forget to `npm run test:unit` to verify that
 your tests are working as expected.
 
 ## Specific Testing Scenarios

@@ -1,6 +1,3 @@
-import { sort as semverSort, SemVer } from 'semver'
-
-import { spawn } from '../changelog/spawn'
 import { getLogLines } from '../changelog/git'
 import {
   convertToChangelogFormat,
@@ -9,42 +6,32 @@ import {
 
 import { Channel } from './channel'
 import { getNextVersionNumber } from './version'
-import { execSync } from 'child_process'
+import { execFileSync } from 'child_process'
 
 import { writeFileSync } from 'fs'
 import { join } from 'path'
 import { format } from 'prettier'
 import { assertNever } from '../../app/src/lib/fatal-error'
+import { sh } from '../sh'
+import { readFile } from 'fs/promises'
+
+import { getLatestRelease } from './tags'
+import { getNpmCommand } from '../npm'
 
 const changelogPath = join(__dirname, '..', '..', 'changelog.json')
 
-/**
- * Returns the latest release tag, according to git and semver
- * (ignores test releases)
- *
- * @param options there's only one option `excludeBetaReleases`,
- *                which is a boolean
- */
-async function getLatestRelease(options: {
-  excludeBetaReleases: boolean
-}): Promise<string> {
-  const allTags = await spawn('git', ['tag'])
-  let releaseTags = allTags
-    .split('\n')
-    .filter(tag => tag.startsWith('release-'))
-    .filter(tag => !tag.includes('-linux'))
-    .filter(tag => !tag.includes('-test'))
-
-  if (options.excludeBetaReleases) {
-    releaseTags = releaseTags.filter(tag => !tag.includes('-beta'))
+async function createReleaseBranch(version: string): Promise<void> {
+  try {
+    const versionBranch = `releases/${version}`
+    const currentBranch = (
+      await sh('git', 'rev-parse', '--abbrev-ref', 'HEAD')
+    ).trim()
+    if (currentBranch !== versionBranch) {
+      await sh('git', 'checkout', '-b', versionBranch)
+    }
+  } catch (error) {
+    console.log(`Failed to create release branch: ${error}`)
   }
-
-  const releaseVersions = releaseTags.map(tag => tag.substr(8))
-
-  const sortedTags = semverSort(releaseVersions)
-  const latestTag = sortedTags[sortedTags.length - 1]
-
-  return latestTag instanceof SemVer ? latestTag.raw : latestTag
 }
 
 /** Converts a string to Channel type if possible */
@@ -65,9 +52,9 @@ function parseChannel(arg: string): Channel {
 function printInstructions(nextVersion: string, entries: Array<string>) {
   const baseSteps = [
     'Revise the release notes according to https://github.com/desktop/desktop/blob/development/docs/process/writing-release-notes.md',
-    'Lint them with: yarn draft-release:format',
+    'Lint them with: npm run draft-release:format',
     'Commit these changes (on a "release" branch) and push them to GitHub',
-    'Read this to perform the release: https://github.com/desktop/desktop/blob/development/docs/process/releasing-updates.md',
+    'See the deploy repo for details on performing the release: https://github.com/desktop/deploy',
   ]
   // if an empty list, we assume the new entries have already been
   // written to the changelog file
@@ -104,23 +91,37 @@ export async function run(args: ReadonlyArray<string>): Promise<void> {
   }
 
   const channel = parseChannel(args[0])
-  const excludeBetaReleases = channel === 'production'
-  const previousVersion = await getLatestRelease({ excludeBetaReleases })
+  const draftPretext = args[1] === '--pretext'
+  const previousVersion = await getLatestRelease({
+    excludeBetaReleases: channel === 'production' || channel === 'test',
+    excludeTestReleases: channel === 'production' || channel === 'beta',
+  })
   const nextVersion = getNextVersionNumber(previousVersion, channel)
+
+  console.log(`Creating release branch for "${nextVersion}"...`)
+  createReleaseBranch(nextVersion)
+  console.log(`Done!`)
 
   console.log(`Setting app version to "${nextVersion}" in app/package.json...`)
 
   try {
     // this can throw
     // sets the npm version in app/
-    execSync(`npm version ${nextVersion} --allow-same-version`, {
+    const npm = getNpmCommand([
+      'version',
+      nextVersion,
+      '--allow-same-version',
+      '--no-git-tag-version',
+      '--ignore-scripts',
+    ])
+    execFileSync(npm.executable, npm.args, {
       cwd: join(__dirname, '..', '..', 'app'),
       encoding: 'utf8',
     })
     console.log(`Set!`)
   } catch (e) {
     console.warn(`Setting the app version failed 😿
-    (${e.message})
+    (${e instanceof Error ? e.message : e})
     Please manually set it to ${nextVersion} in app/package.json.`)
   }
 
@@ -128,6 +129,13 @@ export async function run(args: ReadonlyArray<string>): Promise<void> {
 
   const currentChangelog: IChangelog = require(changelogPath)
   const newEntries = new Array<string>()
+
+  if (draftPretext) {
+    const pretext = await getPretext()
+    if (pretext !== null) {
+      newEntries.push(pretext)
+    }
+  }
 
   switch (channel) {
     case 'production': {
@@ -177,7 +185,11 @@ export async function run(args: ReadonlyArray<string>): Promise<void> {
       console.log('Added!')
       printInstructions(nextVersion, [])
     } catch (e) {
-      console.warn(`Writing the changelog failed 😿\n(${e.message})`)
+      console.warn(
+        `Writing the changelog failed 😿\n(${
+          e instanceof Error ? e.message : e
+        })`
+      )
       printInstructions(nextVersion, newEntries)
     }
   } else {
@@ -208,4 +220,21 @@ type ChangelogReleases = { [key: string]: ReadonlyArray<string> }
 
 interface IChangelog {
   releases: ChangelogReleases
+}
+
+async function getPretext(): Promise<string | null> {
+  const pretextPath = join(
+    __dirname,
+    '..',
+    '..',
+    'app',
+    'static',
+    'common',
+    'pretext-draft.md'
+  )
+  const pretext = await readFile(pretextPath, 'utf8')
+  if (pretext.trim() === '') {
+    return null
+  }
+  return `[Pretext] ${pretext}`
 }

@@ -1,51 +1,23 @@
 import * as React from 'react'
+
 import { Repository } from '../../models/repository'
-import { Octicon, iconForRepository, OcticonSymbol } from '../octicons'
-import { showContextualMenu } from '../main-process-proxy'
+import { Octicon, iconForRepository } from '../octicons'
+import * as octicons from '../octicons/octicons.generated'
 import { Repositoryish } from './group-repositories'
-import { IMenuItem } from '../../lib/menu-item'
 import { HighlightText } from '../lib/highlight-text'
 import { IMatches } from '../../lib/fuzzy-find'
 import { IAheadBehind } from '../../models/branch'
-import {
-  RevealInFileManagerLabel,
-  DefaultEditorLabel,
-} from '../lib/context-menu'
-import { enableRepositoryAliases } from '../../lib/feature-flag'
 import classNames from 'classnames'
+import { createObservableRef } from '../lib/observable-ref'
+import { Tooltip } from '../lib/tooltip'
+import { enableAccessibleListToolTips } from '../../lib/feature-flag'
+import { TooltippedContent } from '../lib/tooltipped-content'
 
 interface IRepositoryListItemProps {
   readonly repository: Repositoryish
 
-  /** Whether the user has enabled the setting to confirm removing a repository from the app */
-  readonly askForConfirmationOnRemoveRepository: boolean
-
-  /** Called when the repository should be removed. */
-  readonly onRemoveRepository: (repository: Repositoryish) => void
-
-  /** Called when the repository should be shown in Finder/Explorer/File Manager. */
-  readonly onShowRepository: (repository: Repositoryish) => void
-
-  /** Called when the repository should be shown in the shell. */
-  readonly onOpenInShell: (repository: Repositoryish) => void
-
-  /** Called when the repository should be opened in an external editor */
-  readonly onOpenInExternalEditor: (repository: Repositoryish) => void
-
-  /** Called when the repository alias should be changed */
-  readonly onChangeRepositoryAlias: (repository: Repository) => void
-
-  /** Called when the repository alias should be removed */
-  readonly onRemoveRepositoryAlias: (repository: Repository) => void
-
-  /** The current external editor selected by the user */
-  readonly externalEditorLabel?: string
-
   /** Does the repository need to be disambiguated in the list? */
   readonly needsDisambiguation: boolean
-
-  /** The label for the user's preferred shell. */
-  readonly shellLabel: string
 
   /** The characters in the repository name to highlight */
   readonly matches: IMatches
@@ -62,25 +34,16 @@ export class RepositoryListItem extends React.Component<
   IRepositoryListItemProps,
   {}
 > {
+  private readonly listItemRef = createObservableRef<HTMLDivElement>()
+
   public render() {
     const repository = this.props.repository
-    const path = repository.path
     const gitHubRepo =
       repository instanceof Repository ? repository.gitHubRepository : null
     const hasChanges = this.props.changedFilesCount > 0
 
     const alias: string | null =
       repository instanceof Repository ? repository.alias : null
-
-    const repoTooltipComponents = gitHubRepo
-      ? [gitHubRepo.fullName, gitHubRepo.htmlURL, path]
-      : [path]
-
-    if (alias !== null) {
-      repoTooltipComponents.unshift(alias)
-    }
-
-    const repoTooltip = repoTooltipComponents.join('\n')
 
     let prefix: string | null = null
     if (this.props.needsDisambiguation && gitHubRepo) {
@@ -92,11 +55,14 @@ export class RepositoryListItem extends React.Component<
     })
 
     return (
-      <div
-        onContextMenu={this.onContextMenu}
-        className="repository-list-item"
-        title={repoTooltip}
-      >
+      <div className="repository-list-item" ref={this.listItemRef}>
+        <Tooltip
+          target={this.listItemRef}
+          disabled={enableAccessibleListToolTips()}
+        >
+          {this.renderTooltip()}
+        </Tooltip>
+
         <Octicon
           className="icon-for-repository"
           symbol={iconForRepository(repository)}
@@ -119,6 +85,23 @@ export class RepositoryListItem extends React.Component<
     )
   }
 
+  private renderTooltip() {
+    const repo = this.props.repository
+    const gitHubRepo = repo instanceof Repository ? repo.gitHubRepository : null
+    const alias = repo instanceof Repository ? repo.alias : null
+    const realName = gitHubRepo ? gitHubRepo.fullName : repo.name
+
+    return (
+      <>
+        <div>
+          <strong>{realName}</strong>
+          {alias && <> ({alias})</>}
+        </div>
+        <div>{repo.path}</div>
+      </>
+    )
+  }
+
   public shouldComponentUpdate(nextProps: IRepositoryListItemProps): boolean {
     if (
       nextProps.repository instanceof Repository &&
@@ -130,99 +113,6 @@ export class RepositoryListItem extends React.Component<
       )
     } else {
       return true
-    }
-  }
-
-  private onContextMenu = (event: React.MouseEvent<any>) => {
-    event.preventDefault()
-
-    const repository = this.props.repository
-    const missing = repository instanceof Repository && repository.missing
-    const openInExternalEditor = this.props.externalEditorLabel
-      ? `Open in ${this.props.externalEditorLabel}`
-      : DefaultEditorLabel
-
-    const items: ReadonlyArray<IMenuItem> = [
-      ...this.buildAliasMenuItems(),
-      {
-        label: `Open in ${this.props.shellLabel}`,
-        action: this.openInShell,
-        enabled: !missing,
-      },
-      {
-        label: RevealInFileManagerLabel,
-        action: this.showRepository,
-        enabled: !missing,
-      },
-      {
-        label: openInExternalEditor,
-        action: this.openInExternalEditor,
-        enabled: !missing,
-      },
-      { type: 'separator' },
-      {
-        label: this.props.askForConfirmationOnRemoveRepository
-          ? 'Remove…'
-          : 'Remove',
-        action: this.removeRepository,
-      },
-    ]
-
-    showContextualMenu(items)
-  }
-
-  private buildAliasMenuItems(): ReadonlyArray<IMenuItem> {
-    const repository = this.props.repository
-
-    if (!(repository instanceof Repository) || !enableRepositoryAliases()) {
-      return []
-    }
-
-    const verb = repository.alias == null ? 'Create' : 'Change'
-    const items: Array<IMenuItem> = [
-      {
-        label: __DARWIN__ ? `${verb} Alias` : `${verb} alias`,
-        action: this.changeAlias,
-      },
-    ]
-
-    if (repository.alias !== null) {
-      items.push({
-        label: __DARWIN__ ? 'Remove Alias' : 'Remove alias',
-        action: this.removeAlias,
-      })
-    }
-
-    items.push({ type: 'separator' })
-
-    return items
-  }
-
-  private removeRepository = () => {
-    this.props.onRemoveRepository(this.props.repository)
-  }
-
-  private showRepository = () => {
-    this.props.onShowRepository(this.props.repository)
-  }
-
-  private openInShell = () => {
-    this.props.onOpenInShell(this.props.repository)
-  }
-
-  private openInExternalEditor = () => {
-    this.props.onOpenInExternalEditor(this.props.repository)
-  }
-
-  private changeAlias = () => {
-    if (this.props.repository instanceof Repository) {
-      this.props.onChangeRepositoryAlias(this.props.repository)
-    }
-  }
-
-  private removeAlias = () => {
-    if (this.props.repository instanceof Repository) {
-      this.props.onRemoveRepositoryAlias(this.props.repository)
     }
   }
 }
@@ -253,23 +143,29 @@ const renderAheadBehindIndicator = (aheadBehind: IAheadBehind) => {
     'its tracked branch.'
 
   return (
-    <div className="ahead-behind" title={aheadBehindTooltip}>
-      {ahead > 0 && <Octicon symbol={OcticonSymbol.arrowUp} />}
-      {behind > 0 && <Octicon symbol={OcticonSymbol.arrowDown} />}
-    </div>
+    <TooltippedContent
+      className="ahead-behind"
+      tagName="div"
+      tooltip={aheadBehindTooltip}
+      disabled={enableAccessibleListToolTips()}
+    >
+      {ahead > 0 && <Octicon symbol={octicons.arrowUp} />}
+      {behind > 0 && <Octicon symbol={octicons.arrowDown} />}
+    </TooltippedContent>
   )
 }
 
 const renderChangesIndicator = () => {
   return (
-    <div
+    <TooltippedContent
       className="change-indicator-wrapper"
-      title="There are uncommitted changes in this repository"
+      tooltip="There are uncommitted changes in this repository"
+      disabled={enableAccessibleListToolTips()}
     >
-      <Octicon symbol={OcticonSymbol.dotFill} />
-    </div>
+      <Octicon symbol={octicons.dotFill} />
+    </TooltippedContent>
   )
 }
 
-const commitGrammar = (commitNum: number) =>
+export const commitGrammar = (commitNum: number) =>
   `${commitNum} commit${commitNum > 1 ? 's' : ''}` // english is hard

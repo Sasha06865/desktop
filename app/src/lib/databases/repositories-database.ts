@@ -1,25 +1,58 @@
-import Dexie from 'dexie'
+import Dexie, { Transaction } from 'dexie'
 import { BaseDatabase } from './base-database'
 import { WorkflowPreferences } from '../../models/workflow-preferences'
+import { assertNonNullable } from '../fatal-error'
+import { GitHubAccountType } from '../api'
 
 export interface IDatabaseOwner {
   readonly id?: number
+  /**
+   * A case-insensitive lookup key which uniquely identifies a particular
+   * user on a particular endpoint. See getOwnerKey for more information.
+   */
+  readonly key: string
   readonly login: string
   readonly endpoint: string
+  readonly type?: GitHubAccountType
 }
 
 export interface IDatabaseGitHubRepository {
   readonly id?: number
+  /**
+   * The lowercase login of the account which this metadata was fetched with,
+   * or an empty string for metadata that isn't attributable to an account
+   * (unassigned repositories and records predating multi-account support).
+   *
+   * This is not the repository's account assignment. That's the `login` field
+   * of the local repository (`IDatabaseRepository`), which is the source of
+   * truth and is changed by explicit user choice. This field is derived from
+   * it and only scopes the metadata cache.
+   *
+   * It's necessary because multiple local repositories can point to the same
+   * GitHub repository while being assigned to different accounts, and some of
+   * the data we store differs depending on which account fetched it. The
+   * `permissions` field is one example (one account might be an admin while
+   * another has read-only access). This record's `id` also keys other
+   * account-dependent data, such as protected branches and cached pull
+   * requests, which may include private data that only one of the accounts is
+   * allowed to see. Including the login in the unique
+   * `[ownerID+name+accountLogin]` index gives each account its own record,
+   * and therefore its own `id`, which isolates all such data without having
+   * to include the login in every dependent cache key.
+   *
+   * A record's `accountLogin` never changes. When a local repository is
+   * assigned to another account it switches to the record scoped to that
+   * account, creating one if needed, rather than rewriting this one.
+   */
+  readonly accountLogin?: string
   readonly ownerID: number
   readonly name: string
   readonly private: boolean | null
   readonly htmlURL: string | null
-  readonly defaultBranch: string | null
   readonly cloneURL: string | null
 
   /** The database ID of the parent repository if the repository is a fork. */
   readonly parentID: number | null
-
   /** The last time a prune was attempted on the repository */
   readonly lastPruneDate: number | null
 
@@ -47,6 +80,18 @@ export interface IDatabaseRepository {
   readonly alias: string | null
   readonly missing: boolean
 
+  /** Undefined only for records awaiting the one-time account migration. */
+  readonly login?: string | null
+
+  /** The path to the .git directory for this repository */
+  readonly gitDir?: string
+
+  /**
+   * The path to the main worktree of this repository, recorded when switching
+   * onto one of its linked worktrees.
+   */
+  readonly mainWorktreePath?: string
+
   /** The last time the stash entries were checked for the repository */
   readonly lastStashCheckDate?: number | null
 
@@ -70,16 +115,22 @@ type BranchKey = [number, string]
 /** The repositories database. */
 export class RepositoriesDatabase extends BaseDatabase {
   /** The local repositories table. */
-  public repositories!: Dexie.Table<IDatabaseRepository, number>
+  public declare repositories: Dexie.Table<IDatabaseRepository, number>
 
   /** The GitHub repositories table. */
-  public gitHubRepositories!: Dexie.Table<IDatabaseGitHubRepository, number>
+  public declare gitHubRepositories: Dexie.Table<
+    IDatabaseGitHubRepository,
+    number
+  >
 
   /** A table containing the names of protected branches per repository. */
-  public protectedBranches!: Dexie.Table<IDatabaseProtectedBranch, BranchKey>
+  public declare protectedBranches: Dexie.Table<
+    IDatabaseProtectedBranch,
+    BranchKey
+  >
 
   /** The GitHub repository owners table. */
-  public owners!: Dexie.Table<IDatabaseOwner, number>
+  public declare owners: Dexie.Table<IDatabaseOwner, number>
 
   /**
    * Initialize a new repository database.
@@ -124,13 +175,33 @@ export class RepositoriesDatabase extends BaseDatabase {
     })
 
     this.conditionalVersion(8, {}, ensureNoUndefinedParentID)
+    this.conditionalVersion(9, { owners: '++id, &key' }, createOwnerKey)
+    this.conditionalVersion(
+      10,
+      {
+        gitHubRepositories: '++id, &[ownerID+name+accountLogin]',
+      },
+      async tx => {
+        // Legacy permissions cannot be attributed to a particular account.
+        await tx
+          .table<IDatabaseGitHubRepository, number>('gitHubRepositories')
+          .toCollection()
+          .modify({ accountLogin: '', permissions: null })
+        await tx.table('protectedBranches').clear()
+      }
+    )
+    // Older development builds can patch the legacy owner/name index back
+    // into an account-scoped database. A real upgrade removes that stale index.
+    this.conditionalVersion(11, {
+      gitHubRepositories: '++id, &[ownerID+name+accountLogin]',
+    })
   }
 }
 
 /**
  * Remove any duplicate GitHub repositories that have the same owner and name.
  */
-function removeDuplicateGitHubRepositories(transaction: Dexie.Transaction) {
+function removeDuplicateGitHubRepositories(transaction: Transaction) {
   const table = transaction.table<IDatabaseGitHubRepository, number>(
     'gitHubRepositories'
   )
@@ -150,11 +221,81 @@ function removeDuplicateGitHubRepositories(transaction: Dexie.Transaction) {
   })
 }
 
-async function ensureNoUndefinedParentID(tx: Dexie.Transaction) {
+async function ensureNoUndefinedParentID(tx: Transaction) {
   return tx
     .table<IDatabaseGitHubRepository, number>('gitHubRepositories')
     .toCollection()
     .filter(ghRepo => ghRepo.parentID === undefined)
     .modify({ parentID: null })
     .then(modified => log.info(`ensureNoUndefinedParentID: ${modified}`))
+}
+
+/**
+ * Replace the case-sensitive [endpoint+login] index with a case-insensitive
+ * lookup key in order to allow us to persist the proper case of a login.
+ *
+ * In addition to adding the key this transition will, out of an abundance of
+ * caution, guard against the possibility that the previous table (being
+ * case-sensitive) will contain two rows for the same user (only differing in
+ * case). This could happen if the Desktop installation as been constantly
+ * transitioned since before we started storing logins in lower case
+ * (https://github.com/desktop/desktop/pull/1242). This scenario ought to be
+ * incredibly unlikely.
+ */
+async function createOwnerKey(tx: Transaction) {
+  const ownersTable = tx.table<IDatabaseOwner, number>('owners')
+  const ghReposTable = tx.table<IDatabaseGitHubRepository, number>(
+    'gitHubRepositories'
+  )
+  const allOwners = await ownersTable.toArray()
+
+  const ownerByKey = new Map<string, IDatabaseOwner>()
+  const newOwnerIds = new Array<{ from: number; to: number }>()
+  const ownersToDelete = new Array<number>()
+
+  for (const owner of allOwners) {
+    assertNonNullable(owner.id, 'Missing owner id')
+
+    const key = getOwnerKey(owner.endpoint, owner.login)
+    const existingOwner = ownerByKey.get(key)
+
+    // If we've found a duplicate owner where that only differs by case we
+    // can't know which one of the two is accurate but that doesn't matter
+    // as it will eventually get corrected from fresh API data, we just need
+    // to pick one over the other and update any GitHubRepository still pointing
+    // to the owner to be deleted.
+    if (existingOwner !== undefined) {
+      assertNonNullable(existingOwner.id, 'Missing existing owner id')
+      log.warn(
+        `createOwnerKey: Conflicting owner data ${owner.id} (${owner.login}) and ${existingOwner.id} (${existingOwner.login})`
+      )
+      newOwnerIds.push({ from: owner.id, to: existingOwner.id })
+      ownersToDelete.push(owner.id)
+    } else {
+      ownerByKey.set(key, { ...owner, key })
+    }
+  }
+
+  log.info(`createOwnerKey: Updating ${ownerByKey.size} owners with keys`)
+  await ownersTable.bulkPut([...ownerByKey.values()])
+
+  for (const mapping of newOwnerIds) {
+    const modified = await ghReposTable
+      .where('[ownerID+name]')
+      .between([mapping.from], [mapping.from + 1])
+      .modify({ ownerID: mapping.to })
+
+    log.info(`createOwnerKey: ${modified} repositories got new owner ids`)
+  }
+
+  await ownersTable.bulkDelete(ownersToDelete)
+}
+
+/* Creates a case-insensitive key used to uniquely identify an owner
+ * based on the endpoint and login. Note that the key happens to
+ * match the canonical API url for the user. This has no practical
+ * purpose but can make debugging a little bit easier.
+ */
+export function getOwnerKey(endpoint: string, login: string) {
+  return `${endpoint}/users/${login}`.toLowerCase()
 }

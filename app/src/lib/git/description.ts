@@ -1,9 +1,9 @@
 import * as Path from 'path'
-import * as FSE from 'fs-extra'
+import { readFile, writeFile } from 'fs/promises'
 
 const GitDescriptionPath = '.git/description'
 
-const DefaultGitDescription =
+export const DefaultGitDescription =
   "Unnamed repository; edit this file 'description' to name the repository.\n"
 
 /** Get the repository's description from the .git/description file. */
@@ -13,12 +13,12 @@ export async function getGitDescription(
   const path = Path.join(repositoryPath, GitDescriptionPath)
 
   try {
-    const data = await FSE.readFile(path, 'utf8')
+    const data = await readFile(path, 'utf8')
     if (data === DefaultGitDescription) {
       return ''
     }
     return data
-  } catch (err) {
+  } catch {
     return ''
   }
 }
@@ -29,5 +29,5 @@ export async function writeGitDescription(
   description: string
 ): Promise<void> {
   const fullPath = Path.join(repositoryPath, GitDescriptionPath)
-  await FSE.writeFile(fullPath, description)
+  await writeFile(fullPath, description)
 }

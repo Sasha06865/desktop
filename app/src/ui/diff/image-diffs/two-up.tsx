@@ -27,7 +27,8 @@ export class TwoUp extends React.Component<ITwoUpProps, {}> {
     const diffBytesSign = diffBytes >= 0 ? '+' : ''
 
     const style: React.CSSProperties = {
-      maxWidth: this.props.maxSize.width,
+      maxWidth:
+        this.props.maxSize.width < 200 ? undefined : this.props.maxSize.width,
     }
 
     return (
@@ -44,7 +45,7 @@ export class TwoUp extends React.Component<ITwoUpProps, {}> {
               <span className="strong">W:</span> {previousImageSize.width}
               px | <span className="strong">H:</span> {previousImageSize.height}
               px | <span className="strong">Size:</span>{' '}
-              {formatBytes(previous.bytes, 2, false)}
+              {formatBytes(previous.bytes, 2)}
             </div>
           </div>
 
@@ -59,7 +60,7 @@ export class TwoUp extends React.Component<ITwoUpProps, {}> {
               <span className="strong">W:</span> {currentImageSize.width}
               px | <span className="strong">H:</span> {currentImageSize.height}
               px | <span className="strong">Size:</span>{' '}
-              {formatBytes(current.bytes, 2, false)}
+              {formatBytes(current.bytes, 2)}
             </div>
           </div>
         </div>
@@ -72,11 +73,7 @@ export class TwoUp extends React.Component<ITwoUpProps, {}> {
             })}
           >
             {diffBytes !== 0
-              ? `${diffBytesSign}${formatBytes(
-                  diffBytes,
-                  2,
-                  false
-                )} (${diffPercent})`
+              ? `${diffBytesSign}${formatBytes(diffBytes, 2)} (${diffPercent})`
               : 'No size difference'}
           </span>
         </div>

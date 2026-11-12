@@ -1,161 +1,221 @@
 import * as React from 'react'
 import { DialogContent } from '../dialog'
-import { SuggestedBranchNames } from '../../lib/helpers/default-branch'
 import { RefNameTextBox } from '../lib/ref-name-text-box'
 import { Ref } from '../lib/ref'
-import { RadioButton } from '../lib/radio-button'
+import { LinkButton } from '../lib/link-button'
 import { Account } from '../../models/account'
 import { GitConfigUserForm } from '../lib/git-config-user-form'
+import { TabBar } from '../tab-bar'
+import { Checkbox, CheckboxValue } from '../lib/checkbox'
+import { Select } from '../lib/select'
+import {
+  shellFriendlyNames,
+  SupportedHooksEnvShell,
+} from '../../lib/hooks/config'
 
 interface IGitProps {
   readonly name: string
   readonly email: string
   readonly defaultBranch: string
+  readonly isLoadingGitConfig: boolean
 
-  readonly dotComAccount: Account | null
-  readonly enterpriseAccount: Account | null
+  readonly accounts: ReadonlyArray<Account>
 
   readonly onNameChanged: (name: string) => void
   readonly onEmailChanged: (email: string) => void
   readonly onDefaultBranchChanged: (defaultBranch: string) => void
+
+  readonly onEditGlobalGitConfig: () => void
+
+  readonly selectedTabIndex?: number
+  readonly onSelectedTabIndexChanged: (index: number) => void
+
+  readonly onEnableGitHookEnvChanged: (enableGitHookEnv: boolean) => void
+  readonly onCacheGitHookEnvChanged: (cacheGitHookEnv: boolean) => void
+  readonly onSelectedShellChanged: (selectedShell: string) => void
+
+  readonly enableGitHookEnv: boolean
+  readonly cacheGitHookEnv: boolean
+  readonly selectedShell: string
 }
 
-interface IGitState {
-  /**
-   * True if the default branch setting is not one of the suggestions.
-   * It's used to display the "Other" text box that allows the user to
-   * enter a custom branch name.
-   */
-  readonly defaultBranchIsOther: boolean
-}
+const windowsShells: ReadonlyArray<SupportedHooksEnvShell> = [
+  'git-bash',
+  'pwsh',
+  'powershell',
+  'cmd',
+]
 
-// This will be the prepopulated branch name on the "other" input
-// field when the user selects it.
-const OtherNameForDefaultBranch = ''
-
-export class Git extends React.Component<IGitProps, IGitState> {
-  private defaultBranchInputRef = React.createRef<RefNameTextBox>()
-
-  public constructor(props: IGitProps) {
-    super(props)
-
-    this.state = {
-      defaultBranchIsOther: !SuggestedBranchNames.includes(
-        this.props.defaultBranch
-      ),
-    }
+export class Git extends React.Component<IGitProps> {
+  private get selectedTabIndex() {
+    return this.props.selectedTabIndex ?? 0
   }
 
-  public componentDidUpdate(prevProps: IGitProps) {
-    // Focus the text input that allows the user to enter a custom
-    // branch name when the user has selected "Other...".
-    if (
-      this.props.defaultBranch !== prevProps.defaultBranch &&
-      this.props.defaultBranch === OtherNameForDefaultBranch &&
-      this.defaultBranchInputRef.current !== null
-    ) {
-      this.defaultBranchInputRef.current.focus()
-    }
+  private onTabClicked = (index: number) => {
+    this.props.onSelectedTabIndexChanged?.(index)
+  }
+
+  private onEnableGitHookEnvChanged = (
+    event: React.FormEvent<HTMLInputElement>
+  ) => {
+    this.props.onEnableGitHookEnvChanged(event.currentTarget.checked)
+  }
+
+  private onCacheGitHookEnvChanged = (
+    event: React.FormEvent<HTMLInputElement>
+  ) => {
+    this.props.onCacheGitHookEnvChanged(event.currentTarget.checked)
+  }
+
+  private onSelectedShellChanged = (
+    event: React.FormEvent<HTMLSelectElement>
+  ) => {
+    this.props.onSelectedShellChanged(event.currentTarget.value)
+  }
+
+  private renderHooksSettings() {
+    return (
+      <>
+        <Checkbox
+          label="Load Git hook environment variables from shell"
+          ariaDescribedBy="git-hooks-env-description"
+          value={
+            this.props.enableGitHookEnv ? CheckboxValue.On : CheckboxValue.Off
+          }
+          onChange={this.onEnableGitHookEnvChanged}
+        />
+        <p id="git-hooks-env-description" className="settings-description">
+          When enabled, GitHub Desktop will attempt to load environment
+          variables from your shell when executing Git hooks. This is useful if
+          your Git hooks depend on environment variables set in your shell
+          configuration files, a common practice for version managers such as
+          nvm, rbenv, asdf, etc.
+        </p>
+
+        {this.props.enableGitHookEnv && __WIN32__ && (
+          <>
+            <Select
+              className="git-hook-shell-select"
+              label={'Shell to use when loading environment'}
+              value={this.props.selectedShell}
+              onChange={this.onSelectedShellChanged}
+            >
+              {windowsShells
+                .map(s => ({ key: s, title: shellFriendlyNames[s] }))
+                .map(s => (
+                  <option key={s.key} value={s.key}>
+                    {s.title}
+                  </option>
+                ))}
+            </Select>
+          </>
+        )}
+
+        {this.props.enableGitHookEnv && (
+          <>
+            <Checkbox
+              label="Cache Git hook environment variables"
+              ariaDescribedBy="git-hooks-cache-description"
+              onChange={this.onCacheGitHookEnvChanged}
+              value={
+                this.props.cacheGitHookEnv
+                  ? CheckboxValue.On
+                  : CheckboxValue.Off
+              }
+            />
+
+            <div
+              id="git-hooks-cache-description"
+              className="settings-description"
+            >
+              Cache hook environment variables to improve performance. Disable
+              if your hooks rely on frequently changing environment variables.
+            </div>
+          </>
+        )}
+      </>
+    )
   }
 
   public render() {
     return (
-      <DialogContent>
-        {this.renderGitConfigAuthorInfo()}
-        {this.renderDefaultBranchSetting()}
+      <DialogContent className="git-preferences">
+        <TabBar
+          selectedIndex={this.selectedTabIndex}
+          onTabClicked={this.onTabClicked}
+        >
+          <span>Author</span>
+          <span>Default branch</span>
+          <span>Hooks</span>
+        </TabBar>
+        <div className="git-preferences-content">{this.renderCurrentTab()}</div>
       </DialogContent>
     )
   }
 
-  private renderGitConfigAuthorInfo() {
-    return (
-      <GitConfigUserForm
-        email={this.props.email}
-        name={this.props.name}
-        enterpriseAccount={this.props.enterpriseAccount}
-        dotComAccount={this.props.dotComAccount}
-        onEmailChanged={this.props.onEmailChanged}
-        onNameChanged={this.props.onNameChanged}
-      />
-    )
-  }
-
-  private renderWarningMessage = (
-    sanitizedBranchName: string,
-    proposedBranchName: string
-  ) => {
-    if (sanitizedBranchName === '') {
-      return (
-        <>
-          <Ref>{proposedBranchName}</Ref> is an invalid branch name.
-        </>
-      )
+  private renderCurrentTab() {
+    if (this.selectedTabIndex === 0) {
+      return this.renderGitConfigAuthorInfo()
+    } else if (this.selectedTabIndex === 1) {
+      return this.renderDefaultBranchSetting()
+    } else if (this.selectedTabIndex === 2) {
+      return this.renderHooksSettings()
     }
 
+    return null
+  }
+
+  private renderGitConfigAuthorInfo() {
     return (
       <>
-        Will be saved as <Ref>{sanitizedBranchName}</Ref>.
+        <GitConfigUserForm
+          email={this.props.email}
+          name={this.props.name}
+          isLoadingGitConfig={this.props.isLoadingGitConfig}
+          accounts={this.props.accounts}
+          onEmailChanged={this.props.onEmailChanged}
+          onNameChanged={this.props.onNameChanged}
+        />
+        {this.renderEditGlobalGitConfigInfo()}
       </>
     )
   }
 
   private renderDefaultBranchSetting() {
-    const { defaultBranchIsOther } = this.state
-
     return (
       <div className="default-branch-component">
-        <h2>Default branch for new repositories</h2>
+        <h2 id="default-branch-heading">
+          Default branch name for new repositories
+        </h2>
 
-        {SuggestedBranchNames.map((branchName: string) => (
-          <RadioButton
-            key={branchName}
-            checked={
-              !defaultBranchIsOther && this.props.defaultBranch === branchName
-            }
-            value={branchName}
-            label={branchName}
-            onSelected={this.onDefaultBranchChanged}
-          />
-        ))}
-        <RadioButton
-          key={OtherNameForDefaultBranch}
-          checked={defaultBranchIsOther}
-          value={OtherNameForDefaultBranch}
-          label="Other…"
-          onSelected={this.onDefaultBranchChanged}
+        <RefNameTextBox
+          initialValue={this.props.defaultBranch}
+          onValueChange={this.props.onDefaultBranchChanged}
+          ariaLabelledBy={'default-branch-heading'}
+          ariaDescribedBy="default-branch-description"
+          warningMessageVerb="saved"
         />
 
-        {defaultBranchIsOther && (
-          <RefNameTextBox
-            initialValue={this.props.defaultBranch}
-            renderWarningMessage={this.renderWarningMessage}
-            onValueChange={this.props.onDefaultBranchChanged}
-            ref={this.defaultBranchInputRef}
-          />
-        )}
-
-        <p className="git-settings-description">
-          These preferences will edit your global Git config.
+        <p id="default-branch-description" className="settings-description">
+          GitHub's default branch name is <Ref>main</Ref>. You may want to
+          change it due to different workflows, or because your integrations
+          still require the historical default branch name of <Ref>master</Ref>.
         </p>
+
+        {this.renderEditGlobalGitConfigInfo()}
       </div>
     )
   }
 
-  /**
-   * Handler to make sure that we show/hide the text box to enter a custom
-   * branch name when the user clicks on one of the radio buttons.
-   *
-   * We don't want to call this handler on changes to the text box since that
-   * will cause the text box to be hidden if the user types a branch name
-   * that starts with one of the suggested branch names (e.g `mainXYZ`).
-   *
-   * @param defaultBranch string the selected default branch
-   */
-  private onDefaultBranchChanged = (defaultBranch: string) => {
-    this.setState({
-      defaultBranchIsOther: !SuggestedBranchNames.includes(defaultBranch),
-    })
-
-    this.props.onDefaultBranchChanged(defaultBranch)
+  private renderEditGlobalGitConfigInfo() {
+    return (
+      <p className="settings-description">
+        These preferences will{' '}
+        <LinkButton onClick={this.props.onEditGlobalGitConfig}>
+          edit your global Git config file
+        </LinkButton>
+        .
+      </p>
+    )
   }
 }

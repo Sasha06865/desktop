@@ -12,10 +12,12 @@ import {
   formatAsLocalRef,
   getBranches,
   deleteLocalBranch,
+  listWorktrees,
 } from '../../git'
 import { fatalError } from '../../fatal-error'
 import { RepositoryStateCache } from '../repository-state-cache'
-import moment from 'moment'
+import { offsetFromNow } from '../../offset-from'
+import { formatRelative } from '../../format-relative'
 
 /** Check if a repo needs to be pruned at least every 4 hours */
 const BackgroundPruneMinimumInterval = 1000 * 60 * 60 * 4
@@ -67,6 +69,10 @@ export class BranchPruner {
     private readonly repositoriesStateCache: RepositoryStateCache,
     private readonly onPruneCompleted: (repository: Repository) => Promise<void>
   ) {}
+
+  public runOnce() {
+    return this.pruneLocalBranches(DefaultPruneOptions)
+  }
 
   public async start() {
     if (this.timer !== null) {
@@ -140,21 +146,17 @@ export class BranchPruner {
     )
 
     // Only prune if it's been at least 24 hours since the last time
-    const dateNow = moment()
-    const threshold = dateNow.subtract(24, 'hours')
+    const threshold = offsetFromNow(-24, 'hours')
 
     // Using type coalescing behavior to deal with Dexie returning `undefined`
     // for records that haven't been updated with the new field yet
     if (
       options.enforcePruneThreshold &&
       lastPruneDate != null &&
-      threshold.isBefore(lastPruneDate)
+      threshold < lastPruneDate
     ) {
-      log.info(
-        `[BranchPruner] Last prune took place ${moment(lastPruneDate).from(
-          dateNow
-        )} - skipping`
-      )
+      const timeAgo = formatRelative(lastPruneDate - Date.now())
+      log.info(`[BranchPruner] Last prune took place ${timeAgo} - skipping`)
       return
     }
 
@@ -183,7 +185,7 @@ export class BranchPruner {
     }
 
     // Get all branches checked out within the past 2 weeks
-    const twoWeeksAgo = moment().subtract(2, 'weeks').toDate()
+    const twoWeeksAgo = new Date(offsetFromNow(-14, 'days'))
     const recentlyCheckedOutBranches = await getBranchCheckouts(
       this.repository,
       twoWeeksAgo
@@ -197,6 +199,13 @@ export class BranchPruner {
       await getBranches(this.repository, `refs/remotes/`)
     ).map(b => formatAsLocalRef(b.name))
 
+    // get branches checked out in linked worktrees so we don't delete them
+    const worktreeBranches = new Set(
+      (await listWorktrees(this.repository))
+        .map(wt => wt.branch)
+        .filter(b => b !== null)
+    )
+
     // create list of branches to be pruned
     const branchesReadyForPruning = Array.from(mergedBranches.keys()).filter(
       ref => {
@@ -204,6 +213,9 @@ export class BranchPruner {
           return false
         }
         if (recentlyCheckedOutCanonicalRefs.has(ref)) {
+          return false
+        }
+        if (worktreeBranches.has(ref)) {
           return false
         }
         const upstreamRef = getUpstreamRefForLocalBranchRef(ref, allBranches)
@@ -226,7 +238,7 @@ export class BranchPruner {
         continue
       }
 
-      const branchName = branchCanonicalRef.substr(branchRefPrefix.length)
+      const branchName = branchCanonicalRef.substring(branchRefPrefix.length)
 
       if (options.deleteBranch) {
         const isDeleted = await gitStore.performFailableOperation(() =>
@@ -244,7 +256,9 @@ export class BranchPruner {
         log.info(`[BranchPruner] Branch '${branchName}' marked for deletion`)
       }
     }
-    this.onPruneCompleted(this.repository)
+    this.onPruneCompleted(this.repository).catch(e => {
+      log.error(`[BranchPruner] Error calling onPruneCompleted`, e)
+    })
   }
 }
 

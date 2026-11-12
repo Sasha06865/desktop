@@ -2,6 +2,7 @@ import * as React from 'react'
 import { dragAndDropManager } from '../../lib/drag-and-drop-manager'
 import { mouseScroller } from '../../lib/mouse-scroller'
 import { sleep } from '../../lib/promise'
+import { DropTargetSelector } from '../../models/drag-drop'
 
 interface IDraggableProps {
   /**
@@ -14,10 +15,13 @@ interface IDraggableProps {
    * Callback for when the drag ends - user releases mouse (mouse up event) or
    * mouse goes out of screen
    *
-   * @param isOverDropTarget - whether the last element the mouse was over
-   * before the mouse up event matches one of the dropTargetSelectors provided
+   * @param dropTargetSelector - if the last element the mouse was over
+   * before the mouse up event matches one of the dropTargetSelectors provided,
+   * it is that selector enum
    */
-  readonly onDragEnd: (isOverDropTarget: boolean) => void
+  readonly onDragEnd?: (
+    dropTargetSelector: DropTargetSelector | undefined
+  ) => void
 
   /** Callback to render a drag element inside the #dragElement */
   readonly onRenderDragElement: () => void
@@ -29,7 +33,7 @@ interface IDraggableProps {
   readonly isEnabled: boolean
 
   /** An array of css selectors for elements that are valid drop targets. */
-  readonly dropTargetSelectors: ReadonlyArray<string>
+  readonly dropTargetSelectors: ReadonlyArray<DropTargetSelector>
 }
 
 export class Draggable extends React.Component<IDraggableProps> {
@@ -47,10 +51,28 @@ export class Draggable extends React.Component<IDraggableProps> {
     this.dragElement = document.getElementById('dragElement')
   }
 
+  /**
+   * A user can drag a commit if they are holding down the left mouse button or
+   * event.button === 0
+   *
+   * Exceptions:
+   *  - macOS allow emulating a right click by holding down the ctrl and left
+   *    mouse button.
+   *  - user can not drag during a shift click
+   *
+   * All other MouseEvent.button values are:
+   * 2: right button/pen barrel button
+   * 1: middle button
+   * X1, X2: mouse back/forward buttons
+   * 5: pen eraser
+   * -1: No button changed
+   *
+   * Ref: https://www.w3.org/TR/pointerevents/#the-button-property
+   *
+   * */
   private canDragCommit(event: React.MouseEvent<HTMLDivElement>): boolean {
-    // right clicks or shift clicks
     const isSpecialClick =
-      event.button === 2 ||
+      event.button !== 0 ||
       (__DARWIN__ && event.button === 0 && event.ctrlKey) ||
       event.shiftKey
 
@@ -147,8 +169,10 @@ export class Draggable extends React.Component<IDraggableProps> {
     document.removeEventListener('mousemove', this.onMouseMove)
     mouseScroller.clearScrollTimer()
     this.props.onRemoveDragElement()
-    this.props.onDragEnd(this.isLastElemBelowDropTarget())
-    dragAndDropManager.dragEnded()
+    if (this.props.onDragEnd !== undefined) {
+      this.props.onDragEnd(this.getLastElemBelowDropTarget())
+    }
+    dragAndDropManager.dragEnded(this.getLastElemBelowDropTarget())
   }
 
   /**
@@ -156,20 +180,24 @@ export class Draggable extends React.Component<IDraggableProps> {
    * css selectors provided in dropTargetSelectors to determine if the drag
    * ended on target or not.
    */
-  private isLastElemBelowDropTarget = (): boolean => {
+  private getLastElemBelowDropTarget = (): DropTargetSelector | undefined => {
     if (this.elemBelow === null) {
-      return false
+      return
     }
 
-    const foundDropTarget = this.props.dropTargetSelectors.find(dts => {
+    return this.props.dropTargetSelectors.find(dts => {
       return this.elemBelow !== null && this.elemBelow.closest(dts) !== null
     })
-
-    return foundDropTarget !== undefined
   }
 
   public render() {
     return (
+      /**
+       * This a11y linter is a false-positive as the element is facilitating our
+       * drag and drop functionality for reordering, squashing, and
+       * cherry-picking.
+       */
+      // eslint-disable-next-line jsx-a11y/no-static-element-interactions
       <div className="draggable" onMouseDown={this.onMouseDown}>
         {this.props.children}
       </div>

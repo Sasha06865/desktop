@@ -1,5 +1,4 @@
 import * as React from 'react'
-import { sendNonFatalException } from '../lib/helpers/non-fatal-exception'
 import {
   Dialog,
   DialogContent,
@@ -38,7 +37,7 @@ export class MoveToApplicationsFolder extends React.Component<
       <Dialog
         title="Move GitHub Desktop to the Applications folder?"
         id="move-to-applications-folder"
-        dismissable={false}
+        backdropDismissable={false}
         onDismissed={this.props.onDismissed}
         onSubmit={this.onSubmit}
         type="warning"
@@ -48,8 +47,8 @@ export class MoveToApplicationsFolder extends React.Component<
             We've detected that you're not running GitHub Desktop from the
             Applications folder of your machine. This could cause problems with
             the app, including impacting your ability to sign in.
-            <br />
-            <br />
+          </p>
+          <p>
             Do you want to move GitHub Desktop to the Applications folder now?
             This will also restart the app.
           </p>
@@ -98,13 +97,12 @@ export class MoveToApplicationsFolder extends React.Component<
     )
   }
 
-  private onSubmit = () => {
+  private onSubmit = async () => {
     this.props.onDismissed()
 
     try {
-      this.props.dispatcher.moveToApplicationsFolder()
+      await this.props.dispatcher.moveToApplicationsFolder()
     } catch (error) {
-      sendNonFatalException('moveApplication', error)
       this.props.dispatcher.postError(error)
     }
   }

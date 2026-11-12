@@ -1,12 +1,11 @@
-import {
-  GitError as DugiteError,
-  RepositoryDoesNotExistErrorCode,
-} from 'dugite'
+import { GitError as DugiteError } from 'dugite'
 
 import { Dispatcher } from '.'
 import { ExternalEditorError } from '../../lib/editors/shared'
-import { ErrorWithMetadata } from '../../lib/error-with-metadata'
-import { AuthenticationErrors } from '../../lib/git/authentication'
+import {
+  DiscardChangesError,
+  ErrorWithMetadata,
+} from '../../lib/error-with-metadata'
 import { GitError, isAuthFailureError } from '../../lib/git/core'
 import { ShellError } from '../../lib/shells'
 import { UpstreamAlreadyExistsError } from '../../lib/stores/upstream-already-exists-error'
@@ -16,10 +15,15 @@ import {
   Repository,
   isRepositoryWithGitHubRepository,
 } from '../../models/repository'
-import { getDotComAPIEndpoint } from '../../lib/api'
 import { hasWritePermission } from '../../models/github-repository'
 import { RetryActionType } from '../../models/retry-actions'
 import { parseFilesToBeOverwritten } from '../lib/parse-files-to-be-overwritten'
+import { pathExists } from '../../lib/path-exists'
+import {
+  ISecretLocation,
+  ISecretScanResult,
+} from '../secret-scanning/push-protection-error-dialog'
+import { coerceToString } from '../../lib/git/coerce-to-string'
 
 /** An error which also has a code property. */
 interface IErrorWithCode extends Error {
@@ -107,7 +111,7 @@ export async function missingRepositoryHandler(
   const gitError = asGitError(e.underlyingError)
   const missing =
     (gitError && gitError.result.gitError === DugiteError.NotAGitRepository) ||
-    (errorWithCode && errorWithCode.code === RepositoryDoesNotExistErrorCode)
+    (errorWithCode && !(await pathExists(repository.path)))
 
   if (missing) {
     await dispatcher.updateRepositoryMissing(repository, true)
@@ -135,53 +139,6 @@ export async function backgroundTaskHandler(
   } else {
     return error
   }
-}
-
-/** Handle git authentication errors in a manner that seems Right And Good. */
-export async function gitAuthenticationErrorHandler(
-  error: Error,
-  dispatcher: Dispatcher
-): Promise<Error | null> {
-  const e = asErrorWithMetadata(error)
-  if (!e) {
-    return error
-  }
-
-  const gitError = asGitError(e.underlyingError)
-  if (!gitError) {
-    return error
-  }
-
-  const dugiteError = gitError.result.gitError
-  if (!dugiteError) {
-    return error
-  }
-
-  if (!AuthenticationErrors.has(dugiteError)) {
-    return error
-  }
-
-  const repository = e.metadata.repository
-  if (!repository) {
-    return error
-  }
-
-  // If it's a GitHub repository then it's not some generic git server
-  // authentication problem, but more likely a legit permission problem. So let
-  // the error continue to bubble up.
-  if (repository instanceof Repository && repository.gitHubRepository) {
-    return error
-  }
-
-  const retry = e.metadata.retryAction
-  if (!retry) {
-    log.error(`No retry action provided for a git authentication error.`, e)
-    return error
-  }
-
-  await dispatcher.promptForGenericGitAuthentication(repository, retry)
-
-  return null
 }
 
 export async function externalEditorErrorHandler(
@@ -237,7 +194,7 @@ export async function pushNeedsPullHandler(
   }
 
   const dugiteError = gitError.result.gitError
-  if (!dugiteError) {
+  if (dugiteError === null) {
     return error
   }
 
@@ -278,7 +235,7 @@ export async function mergeConflictHandler(
   }
 
   const dugiteError = gitError.result.gitError
-  if (!dugiteError) {
+  if (dugiteError === null) {
     return error
   }
 
@@ -305,21 +262,20 @@ export async function mergeConflictHandler(
 
   switch (gitContext.kind) {
     case 'pull':
-      dispatcher.mergeConflictDetectedFromPull()
+      dispatcher.incrementMetric('mergeConflictFromPullCount')
       break
     case 'merge':
-      dispatcher.mergeConflictDetectedFromExplicitMerge()
+      dispatcher.incrementMetric('mergeConflictFromExplicitMergeCount')
       break
   }
 
   const { currentBranch, theirBranch } = gitContext
 
-  dispatcher.showPopup({
-    type: PopupType.MergeConflicts,
+  dispatcher.handleConflictsDetectedOnError(
     repository,
-    ourBranch: currentBranch,
-    theirBranch,
-  })
+    currentBranch,
+    theirBranch
+  )
 
   return null
 }
@@ -338,7 +294,7 @@ export async function lfsAttributeMismatchHandler(
   }
 
   const dugiteError = gitError.result.gitError
-  if (!dugiteError) {
+  if (dugiteError === null) {
     return error
   }
 
@@ -391,7 +347,7 @@ export async function rebaseConflictsHandler(
   }
 
   const dugiteError = gitError.result.gitError
-  if (!dugiteError) {
+  if (dugiteError === null) {
     return error
   }
 
@@ -418,12 +374,13 @@ export async function rebaseConflictsHandler(
 
   const { currentBranch } = gitContext
 
-  dispatcher.launchRebaseFlow(repository, currentBranch)
+  dispatcher.launchRebaseOperation(repository, currentBranch)
 
   return null
 }
 
-const rejectedPathRe = /^ ! \[remote rejected\] .*? -> .*? \(refusing to allow an OAuth App to create or update workflow `(.*?)` without `workflow` scope\)/m
+const rejectedPathRe =
+  /^ ! \[remote rejected\] .*? -> .*? \(refusing to allow an OAuth App to create or update workflow `(.*?)` without `workflow` scope\)/m
 
 /**
  * Attempts to detect whether an error is the result of a failed push
@@ -449,12 +406,7 @@ export async function refusedWorkflowUpdate(
     return error
   }
 
-  if (repository.gitHubRepository === null) {
-    return error
-  }
-
-  // DotCom only for now.
-  if (repository.gitHubRepository.endpoint !== getDotComAPIEndpoint()) {
+  if (!isRepositoryWithGitHubRepository(repository)) {
     return error
   }
 
@@ -473,7 +425,8 @@ export async function refusedWorkflowUpdate(
   return null
 }
 
-const samlReauthErrorMessageRe = /`([^']+)' organization has enabled or enforced SAML SSO.*?you must re-authorize/s
+const samlReauthErrorMessageRe =
+  /'([^']+)' organization has enabled or enforced SAML SSO.*?you must re-authorize/s
 
 /**
  * Attempts to detect whether an error is the result of a failed push
@@ -504,7 +457,7 @@ export async function samlReauthRequired(error: Error, dispatcher: Dispatcher) {
     return error
   }
 
-  const remoteMessage = getRemoteMessage(gitError.result.stderr)
+  const remoteMessage = getRemoteMessage(coerceToString(gitError.result.stderr))
   const match = samlReauthErrorMessageRe.exec(remoteMessage)
 
   if (!match) {
@@ -607,16 +560,136 @@ export async function localChangesOverwrittenHandler(
   }
 
   if (e.metadata.gitContext?.kind === 'checkout') {
-    dispatcher.recordErrorWhenSwitchingBranchesWithUncommmittedChanges()
+    dispatcher.incrementMetric(
+      'errorWhenSwitchingBranchesWithUncommmittedChanges'
+    )
   }
 
-  const files = parseFilesToBeOverwritten(gitError.result.stderr)
+  const files = parseFilesToBeOverwritten(
+    coerceToString(gitError.result.stderr)
+  )
 
   dispatcher.showPopup({
     type: PopupType.LocalChangesOverwritten,
     repository,
     retryAction,
     files,
+  })
+
+  return null
+}
+
+/**
+ * Handler for when an action the user attempts to discard changes and they
+ * cannot be moved to trash/recycle bin
+ */
+export async function discardChangesHandler(
+  error: Error,
+  dispatcher: Dispatcher
+): Promise<Error | null> {
+  if (!(error instanceof DiscardChangesError)) {
+    return error
+  }
+
+  const { retryAction } = error.metadata
+
+  if (retryAction === undefined) {
+    return error
+  }
+
+  dispatcher.showPopup({
+    type: PopupType.DiscardChangesRetry,
+    retryAction,
+  })
+
+  return null
+}
+
+/**
+ * Extracts secret scanning results from the provided `remoteMessage` string
+ * from the git error provided when GitHub Secret Scanning detects a secret on
+ * push..
+ *
+ * This function parses the output of a secret scanning tool to identify
+ * secrets, their descriptions, locations in the codebase, and bypass URLs.
+ */
+function extractSecretScanningResults(
+  remoteMessage: string
+): ReadonlyArray<ISecretScanResult> {
+  const secretsRegex =
+    /—— (?<description>.*?) —+[\s\S]*?locations:(?<locationsGroup>(?:\s+- commit: [a-f0-9]{40}\s+path: [\s\S]*?)+).*?(?<bypassURL>https[\s\S]*?) /g
+
+  const matches = [...remoteMessage.matchAll(secretsRegex)]
+
+  const secrets: Array<ISecretScanResult> = []
+  if (matches.length === 0) {
+    return secrets
+  }
+
+  for (const match of matches) {
+    if (match.groups === undefined || match.index === undefined) {
+      continue
+    }
+
+    const { bypassURL, description, locationsGroup } = match.groups
+
+    const locationsRegex =
+      /- commit: (?<commitSha>[a-f0-9]{40})\s+path: (?<path>.*?):(?<lineNumber>\d+)/g
+    const locationMatches = [...locationsGroup.matchAll(locationsRegex)]
+
+    const locations: ISecretLocation[] = []
+
+    locationMatches.forEach(locationMatch => {
+      if (locationMatch.groups === undefined) {
+        return
+      }
+      const { commitSha, path, lineNumber } = locationMatch.groups
+      locations.push({
+        commitSha,
+        path,
+        lineNumber: parseInt(lineNumber, 10),
+      })
+    })
+
+    secrets.push({
+      id: bypassURL.split('/').pop() || '',
+      description,
+      bypassURL,
+      locations,
+      requiresApproval: !!match.at(0)?.includes('request an exemption'),
+    })
+  }
+
+  return secrets
+}
+
+/**
+ * Handler for when a push is denied by GitHub's push protection feature of
+ * secret scanning.
+ */
+export async function secretScanningPushProtectionErrorHandler(
+  error: Error,
+  dispatcher: Dispatcher
+) {
+  const e = asErrorWithMetadata(error)
+  if (!e) {
+    return error
+  }
+
+  const gitError = asGitError(e.underlyingError)
+  if (gitError?.result.gitError !== DugiteError.PushWithSecretDetected) {
+    return error
+  }
+
+  const remoteMessage = getRemoteMessage(coerceToString(gitError.result.stderr))
+  const secrets = extractSecretScanningResults(remoteMessage)
+
+  dispatcher.incrementMetric('pushBlockedBySecretScanningCount')
+  dispatcher.incrementMetric('secretsDetectedOnPushCount', secrets.length)
+
+  dispatcher.showPopup({
+    type: PopupType.PushProtectionError,
+    secrets,
   })
 
   return null
@@ -634,6 +707,6 @@ function getRemoteMessage(stderr: string) {
   return stderr
     .split(/\r?\n/)
     .filter(x => x.startsWith(needle))
-    .map(x => x.substr(needle.length))
+    .map(x => x.substring(needle.length))
     .join('\n')
 }

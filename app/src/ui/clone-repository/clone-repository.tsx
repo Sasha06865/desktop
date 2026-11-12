@@ -1,17 +1,22 @@
 import * as Path from 'path'
 import * as React from 'react'
-
-import { remote } from 'electron'
-import { readdir } from 'fs-extra'
 import { Dispatcher } from '../dispatcher'
 import { getDefaultDir, setDefaultDir } from '../lib/default-dir'
-import { Account } from '../../models/account'
+import {
+  Account,
+  IAccountIdentity,
+  isDotComAccount,
+  isEnterpriseAccount,
+  isSameAccount,
+} from '../../models/account'
+import { FoldoutType } from '../../lib/app-state'
 import {
   IRepositoryIdentifier,
   parseRepositoryIdentifier,
   parseRemote,
+  sanitizeCloneName,
 } from '../../lib/remote-parsing'
-import { findAccountForRemoteURL } from '../../lib/find-account'
+import { resolveURLCloneInfo } from '../../lib/clone-info'
 import { API, IAPIRepository, IAPIRepositoryCloneInfo } from '../../lib/api'
 import { Dialog, DialogError, DialogFooter, DialogContent } from '../dialog'
 import { TabBar } from '../tab-bar'
@@ -24,17 +29,24 @@ import { IAccountRepositories } from '../../lib/stores/api-repositories-store'
 import { merge } from '../../lib/merge'
 import { ClickSource } from '../lib/list'
 import { OkCancelButtonGroup } from '../dialog/ok-cancel-button-group'
-import { enableSaveDialogOnCloneRepository } from '../../lib/feature-flag'
+import { showOpenDialog, showSaveDialog } from '../main-process-proxy'
+import { readdir } from 'fs/promises'
+import { isTopMostDialog } from '../dialog/is-top-most'
+import memoizeOne from 'memoize-one'
+import { groupAccountsByHost } from '../../lib/group-accounts-by-host'
+import { SignInResult } from '../../lib/stores/sign-in-store'
+import { LinkButton } from '../lib/link-button'
+import { Row } from '../lib/row'
+import {
+  canonicalMutationPath,
+  isRepositoryAffectedByAssistedCommit,
+} from '../../lib/git/repository-operation'
 
 interface ICloneRepositoryProps {
   readonly dispatcher: Dispatcher
   readonly onDismissed: () => void
 
-  /** The logged in accounts. */
-  readonly dotComAccount: Account | null
-
-  /** The logged in Enterprise account. */
-  readonly enterpriseAccount: Account | null
+  readonly accounts: ReadonlyArray<Account>
 
   /** The initial URL or `owner/name` shortcut to use. */
   readonly initialURL: string | null
@@ -44,6 +56,12 @@ interface ICloneRepositoryProps {
 
   /** Called when the user selects a tab. */
   readonly onTabSelected: (tab: CloneRepositoryTab) => void
+
+  /**
+   * The account last picked in the GitHub tab, or null to use the first
+   * signed-in account in picker order.
+   */
+  readonly selectedAccount: IAccountIdentity | null
 
   /**
    * A map keyed on a user account (GitHub.com or GitHub Enterprise)
@@ -66,6 +84,9 @@ interface ICloneRepositoryProps {
    * available for cloning.
    */
   readonly onRefreshRepositories: (account: Account) => void
+
+  /** Whether the dialog is the top most in the dialog stack */
+  readonly isTopMost: boolean
 }
 
 interface ICloneRepositoryState {
@@ -78,22 +99,13 @@ interface ICloneRepositoryState {
    *
    *  See the onWindowFocus method for more information.
    */
-  readonly initialPath: string
+  readonly initialPath: string | null
 
   /** Are we currently trying to load the entered repository? */
   readonly loading: boolean
 
-  /**
-   * The persisted state of the CloneGitHubRepository component for
-   * the GitHub.com account.
-   */
-  readonly dotComTabState: IGitHubTabState
-
-  /**
-   * The persisted state of the CloneGitHubRepository component for
-   * the GitHub Enterprise account.
-   */
-  readonly enterpriseTabState: IGitHubTabState
+  /** The persisted state of the CloneGitHubRepository component. */
+  readonly gitHubTabState: IGitHubTabState
 
   /**
    * The persisted state of the CloneGenericRepository component.
@@ -115,7 +127,7 @@ interface IBaseTabState {
   readonly lastParsedIdentifier: IRepositoryIdentifier | null
 
   /** The local path to clone to. */
-  readonly path: string
+  readonly path: string | null
 
   /** The user-entered URL or `owner/name` shortcut. */
   readonly url: string
@@ -129,7 +141,7 @@ interface IUrlTabState extends IBaseTabState {
  * Persisted state for the CloneGitHubRepository component.
  */
 interface IGitHubTabState extends IBaseTabState {
-  readonly kind: 'dotComTabState' | 'enterpriseTabState'
+  readonly kind: 'gitHubTabState'
 
   /**
    * The contents of the filter text box used to filter the list of
@@ -144,15 +156,62 @@ interface IGitHubTabState extends IBaseTabState {
   readonly selectedItem: IAPIRepository | null
 }
 
+/** What to clone, captured when the user starts cloning. */
+interface ICloneRequest {
+  readonly tab: CloneRepositoryTab
+  readonly url: string
+  readonly lastParsedIdentifier: IRepositoryIdentifier | null
+  readonly path: string | null
+
+  /**
+   * The account selected in the GitHub tab, or null when cloning from the
+   * URL tab.
+   */
+  readonly account: Account | null
+}
+
 /** The component for cloning a repository. */
 export class CloneRepository extends React.Component<
   ICloneRepositoryProps,
   ICloneRepositoryState
 > {
+  private validatedClonePath:
+    | { readonly path: string; readonly canonical: string }
+    | undefined
+  private cloneDestinationProtected = false
+
+  private checkIsTopMostDialog = isTopMostDialog(
+    () => {
+      this.validatePath()
+      window.addEventListener('focus', this.onWindowFocus)
+    },
+    () => {
+      window.removeEventListener('focus', this.onWindowFocus)
+    }
+  )
+
+  /** The signed-in accounts in the order the account picker lists them. */
+  private getAccountsInPickerOrder = memoizeOne(
+    (accounts: ReadonlyArray<Account>) => [
+      ...accounts.filter(isDotComAccount),
+      ...groupAccountsByHost(accounts.filter(isEnterpriseAccount)).flatMap(
+        ([, hostAccounts]) => hostAccounts
+      ),
+    ]
+  )
+
+  private mounted = false
+
+  /**
+   * The account whose repositories the GitHub tab's selection and filter
+   * belong to. See `resetGitHubTabSelectionIfAccountChanged`.
+   */
+  private gitHubTabAccount: Account | null
+
   public constructor(props: ICloneRepositoryProps) {
     super(props)
 
-    const defaultDirectory = getDefaultDir()
+    const defaultDirectory = null
 
     const initialBaseTabState: IBaseTabState = {
       error: null,
@@ -164,14 +223,8 @@ export class CloneRepository extends React.Component<
     this.state = {
       initialPath: defaultDirectory,
       loading: false,
-      dotComTabState: {
-        kind: 'dotComTabState',
-        filterText: '',
-        selectedItem: null,
-        ...initialBaseTabState,
-      },
-      enterpriseTabState: {
-        kind: 'enterpriseTabState',
+      gitHubTabState: {
+        kind: 'gitHubTabState',
         filterText: '',
         selectedItem: null,
         ...initialBaseTabState,
@@ -181,25 +234,62 @@ export class CloneRepository extends React.Component<
         ...initialBaseTabState,
       },
     }
+
+    this.gitHubTabAccount = this.getSelectedAccount()
+    this.initializePath()
   }
 
   public componentDidUpdate(prevProps: ICloneRepositoryProps) {
     if (prevProps.selectedTab !== this.props.selectedTab) {
       this.validatePath()
     }
+
+    if (prevProps.initialURL !== this.props.initialURL) {
+      this.updateUrl(this.props.initialURL || '')
+    }
+
+    // The effective account can also change without the picker, e.g. when the
+    // selected account is signed out while the dialog is open.
+    if (
+      prevProps.accounts !== this.props.accounts ||
+      prevProps.selectedAccount !== this.props.selectedAccount
+    ) {
+      this.resetGitHubTabSelectionIfAccountChanged(this.getSelectedAccount())
+    }
+
+    const protectedDestination = this.isCloneDestinationProtected()
+    if (this.cloneDestinationProtected !== protectedDestination) {
+      this.cloneDestinationProtected = protectedDestination
+      this.validatePath()
+    }
+    this.checkIsTopMostDialog(this.props.isTopMost)
   }
 
   public componentDidMount() {
+    this.mounted = true
     const initialURL = this.props.initialURL
     if (initialURL) {
       this.updateUrl(initialURL)
     }
 
-    window.addEventListener('focus', this.onWindowFocus)
+    this.checkIsTopMostDialog(this.props.isTopMost)
   }
 
-  public componentWillUnmount() {
-    window.removeEventListener('focus', this.onWindowFocus)
+  public componentWillUnmount(): void {
+    this.mounted = false
+    this.checkIsTopMostDialog(false)
+  }
+
+  private initializePath = async () => {
+    const initialPath = await getDefaultDir()
+    const gitHubTabState = { ...this.state.gitHubTabState, path: initialPath }
+    const urlTabState = { ...this.state.urlTabState, path: initialPath }
+    this.setState({ initialPath, gitHubTabState, urlTabState })
+
+    // Update the local path based on the current url now that we have an
+    // initial path
+    const selectedTabState = this.getSelectedTabState()
+    this.updateUrl(selectedTabState.url)
   }
 
   public render() {
@@ -211,23 +301,31 @@ export class CloneRepository extends React.Component<
         onSubmit={this.clone}
         onDismissed={this.props.onDismissed}
         loading={this.state.loading}
+        disabled={this.state.loading}
       >
         <TabBar
           onTabClicked={this.onTabClicked}
           selectedIndex={this.props.selectedTab}
         >
-          <span>GitHub.com</span>
-          <span>GitHub Enterprise</span>
-          <span>URL</span>
+          <span id="github-tab">GitHub</span>
+          <span id="url-tab">URL</span>
         </TabBar>
 
         {error ? <DialogError>{error.message}</DialogError> : null}
 
-        {this.renderActiveTab()}
+        <div role="tabpanel" aria-labelledby={this.getSelectedTabId()}>
+          {this.renderActiveTab()}
+        </div>
 
         {this.renderFooter()}
       </Dialog>
     )
+  }
+
+  private getSelectedTabId = () => {
+    return this.props.selectedTab === CloneRepositoryTab.GitHub
+      ? 'github-tab'
+      : 'url-tab'
   }
 
   private checkIfCloningDisabled = () => {
@@ -236,16 +334,33 @@ export class CloneRepository extends React.Component<
     const { loading } = this.state
 
     const disabled =
-      url.length === 0 || path.length === 0 || loading || error !== null
+      url.length === 0 ||
+      path == null ||
+      path.length === 0 ||
+      this.isCloneDestinationProtected() ||
+      loading ||
+      error !== null
 
     return disabled
+  }
+
+  private isCloneDestinationProtected(): boolean {
+    const { path } = this.getSelectedTabState()
+    if (path === null) {
+      return false
+    }
+    return isRepositoryAffectedByAssistedCommit(
+      this.validatedClonePath?.path === path
+        ? this.validatedClonePath.canonical
+        : path
+    )
   }
 
   private renderFooter() {
     const selectedTab = this.props.selectedTab
     if (
-      selectedTab !== CloneRepositoryTab.Generic &&
-      !this.getAccountForTab(selectedTab)
+      selectedTab === CloneRepositoryTab.GitHub &&
+      this.getSelectedAccount() === null
     ) {
       return null
     }
@@ -275,7 +390,7 @@ export class CloneRepository extends React.Component<
         const tabState = this.state.urlTabState
         return (
           <CloneGenericRepository
-            path={tabState.path}
+            path={tabState.path ?? ''}
             url={tabState.url}
             onPathChanged={this.onPathChanged}
             onUrlChanged={this.updateUrl}
@@ -283,70 +398,106 @@ export class CloneRepository extends React.Component<
           />
         )
 
-      case CloneRepositoryTab.DotCom:
-      case CloneRepositoryTab.Enterprise: {
-        const account = this.getAccountForTab(tab)
-        if (!account) {
-          return <DialogContent>{this.renderSignIn(tab)}</DialogContent>
-        } else {
-          const accountState = this.props.apiRepositories.get(account)
-          const repositories =
-            accountState === undefined ? null : accountState.repositories
-          const loading =
-            accountState === undefined ? false : accountState.loading
-          const tabState = this.getGitHubTabState(tab)
+      case CloneRepositoryTab.GitHub: {
+        const tabState = this.state.gitHubTabState
+        const selectedAccount = this.getSelectedAccount()
 
-          return (
-            <CloneGithubRepository
-              path={tabState.path}
-              account={account}
-              selectedItem={tabState.selectedItem}
-              onSelectionChanged={this.onSelectionChanged}
-              onPathChanged={this.onPathChanged}
-              onChooseDirectory={this.onChooseDirectory}
-              repositories={repositories}
-              loading={loading}
-              onRefreshRepositories={this.props.onRefreshRepositories}
-              filterText={tabState.filterText}
-              onFilterTextChanged={this.onFilterTextChanged}
-              onItemClicked={this.onItemClicked}
-            />
-          )
+        if (selectedAccount === null) {
+          return <DialogContent>{this.renderSignIn()}</DialogContent>
         }
+
+        const accountState = this.props.apiRepositories.get(selectedAccount)
+        const repositories =
+          accountState === undefined ? null : accountState.repositories
+        const loading =
+          accountState === undefined ? false : accountState.loading
+
+        return (
+          <CloneGithubRepository
+            path={tabState.path ?? ''}
+            account={selectedAccount}
+            accounts={this.props.accounts}
+            selectedItem={tabState.selectedItem}
+            onSelectionChanged={this.onSelectionChanged}
+            onPathChanged={this.onPathChanged}
+            onChooseDirectory={this.onChooseDirectory}
+            repositories={repositories}
+            loading={loading}
+            onRefreshRepositories={this.props.onRefreshRepositories}
+            filterText={tabState.filterText}
+            onFilterTextChanged={this.onFilterTextChanged}
+            onItemClicked={this.onItemClicked}
+            onSelectedAccountChanged={this.onSelectedAccountChanged}
+          />
+        )
       }
       default:
         return assertNever(tab, `Unknown tab: ${tab}`)
     }
   }
 
-  private getAccountForTab(tab: CloneRepositoryTab): Account | null {
-    switch (tab) {
-      case CloneRepositoryTab.DotCom:
-        return this.props.dotComAccount
-      case CloneRepositoryTab.Enterprise:
-        return this.props.enterpriseAccount
-      default:
-        return null
+  private onSelectedAccountChanged = (account: Account) => {
+    this.resetGitHubTabSelectionIfAccountChanged(account)
+    this.props.dispatcher.changeCloneRepositoriesAccount(account)
+  }
+
+  /**
+   * Reset the GitHub tab's selection when it's about to show another
+   * account's repositories.
+   *
+   * The selected repository was listed for the previous account, so it
+   * mustn't carry over to an account that may not be able to access it, or
+   * that is on another host. The account is tracked rather than compared
+   * between renders so that picking an account resets the tab only once, even
+   * though the picked account also arrives later through props.
+   */
+  private resetGitHubTabSelectionIfAccountChanged(account: Account | null) {
+    const previous = this.gitHubTabAccount
+    const changed =
+      account === null || previous === null
+        ? account !== previous
+        : !isSameAccount(account, previous)
+    this.gitHubTabAccount = account
+
+    if (changed) {
+      this.resetGitHubTabSelection()
     }
   }
 
-  private getGitHubTabState(
-    tab: CloneRepositoryTab.DotCom | CloneRepositoryTab.Enterprise
-  ): IGitHubTabState {
-    if (tab === CloneRepositoryTab.DotCom) {
-      return this.state.dotComTabState
-    } else if (tab === CloneRepositoryTab.Enterprise) {
-      return this.state.enterpriseTabState
+  /**
+   * Clear the GitHub tab's selected repository, filter text and URL.
+   *
+   * The filter is cleared as well since the filter list would otherwise
+   * select the first match on its own without reporting it, leaving the
+   * repository selected but the URL empty.
+   */
+  private resetGitHubTabSelection() {
+    this.setGitHubTabState({ selectedItem: null, filterText: '' })
+    if (this.props.selectedTab === CloneRepositoryTab.GitHub) {
+      this.updateUrl('')
     } else {
-      return assertNever(tab, `Unknown tab: ${tab}`)
+      this.setTabState({ url: '' }, CloneRepositoryTab.GitHub)
     }
+  }
+
+  /**
+   * The account to browse and clone with in the GitHub tab: the account last
+   * picked while it's still signed in, otherwise the first account in picker
+   * order. Null when no account is signed in.
+   */
+  private getSelectedAccount(): Account | null {
+    const accounts = this.getAccountsInPickerOrder(this.props.accounts)
+    const { selectedAccount } = this.props
+    return (
+      accounts.find(a => isSameAccount(a, selectedAccount)) ??
+      accounts.at(0) ??
+      null
+    )
   }
 
   private getTabState(tab: CloneRepositoryTab): IBaseTabState {
-    if (tab === CloneRepositoryTab.DotCom) {
-      return this.state.dotComTabState
-    } else if (tab === CloneRepositoryTab.Enterprise) {
-      return this.state.enterpriseTabState
+    if (tab === CloneRepositoryTab.GitHub) {
+      return this.state.gitHubTabState
     } else if (tab === CloneRepositoryTab.Generic) {
       return this.state.urlTabState
     } else {
@@ -380,23 +531,10 @@ export class CloneRepository extends React.Component<
     tab: CloneRepositoryTab,
     callback?: () => void
   ): void {
-    if (tab === CloneRepositoryTab.DotCom) {
+    if (tab === CloneRepositoryTab.GitHub) {
       this.setState(
         prevState => ({
-          dotComTabState: {
-            ...prevState.dotComTabState,
-            ...state,
-          },
-        }),
-        callback
-      )
-    } else if (tab === CloneRepositoryTab.Enterprise) {
-      this.setState(
-        prevState => ({
-          enterpriseTabState: {
-            ...prevState.enterpriseTabState,
-            ...state,
-          },
+          gitHubTabState: { ...prevState.gitHubTabState, ...state },
         }),
         callback
       )
@@ -413,71 +551,63 @@ export class CloneRepository extends React.Component<
   }
 
   private setGitHubTabState<K extends keyof IGitHubTabState>(
-    tabState: Pick<IGitHubTabState, K>,
-    tab: CloneRepositoryTab.DotCom | CloneRepositoryTab.Enterprise
+    tabState: Pick<IGitHubTabState, K>
   ): void {
-    if (tab === CloneRepositoryTab.DotCom) {
-      this.setState(prevState => ({
-        dotComTabState: merge(prevState.dotComTabState, tabState),
-      }))
-    } else if (tab === CloneRepositoryTab.Enterprise) {
-      this.setState(prevState => ({
-        enterpriseTabState: merge(prevState.enterpriseTabState, tabState),
-      }))
-    } else {
-      return assertNever(tab, `Unknown tab: ${tab}`)
-    }
+    this.setState(prevState => ({
+      gitHubTabState: merge(prevState.gitHubTabState, tabState),
+    }))
   }
 
-  private renderSignIn(tab: CloneRepositoryTab) {
+  private renderSignIn() {
     const signInTitle = __DARWIN__ ? 'Sign In' : 'Sign in'
-    switch (tab) {
-      case CloneRepositoryTab.DotCom:
-        return (
-          <CallToAction actionTitle={signInTitle} onAction={this.signInDotCom}>
-            <div>
-              Sign in to your GitHub.com account to access your repositories.
-            </div>
-          </CallToAction>
-        )
-      case CloneRepositoryTab.Enterprise:
-        return (
-          <CallToAction
-            actionTitle={signInTitle}
-            onAction={this.signInEnterprise}
-          >
-            <div>
-              If you have a GitHub Enterprise or AE account at work, sign in to
-              it to get access to your repositories.
-            </div>
-          </CallToAction>
-        )
-      case CloneRepositoryTab.Generic:
-        return null
-      default:
-        return assertNever(tab, `Unknown sign in tab: ${tab}`)
+    return (
+      <>
+        <CallToAction actionTitle={signInTitle} onAction={this.signInDotCom}>
+          <div>
+            Sign in to your GitHub.com account to access your repositories.
+          </div>
+        </CallToAction>
+        <Row className="sign-in-enterprise">
+          <LinkButton onClick={this.signInEnterprise}>
+            {__DARWIN__
+              ? 'Sign In to GitHub Enterprise'
+              : 'Sign in to GitHub Enterprise'}
+          </LinkButton>
+        </Row>
+      </>
+    )
+  }
+
+  /** Select the account the user signed in to from this dialog. */
+  private onSignInResult = (result: SignInResult) => {
+    if (result.kind !== 'success') {
+      return
+    }
+    if (this.mounted) {
+      this.onSelectedAccountChanged(result.account)
+    } else {
+      this.props.dispatcher.changeCloneRepositoriesAccount(result.account)
     }
   }
 
   private signInDotCom = () => {
-    this.props.dispatcher.showDotComSignInDialog()
+    this.props.dispatcher.showDotComSignInDialog(this.onSignInResult)
   }
 
   private signInEnterprise = () => {
-    this.props.dispatcher.showEnterpriseSignInDialog()
+    this.props.dispatcher.showEnterpriseSignInDialog(
+      undefined,
+      this.onSignInResult
+    )
   }
 
   private onFilterTextChanged = (filterText: string) => {
-    if (this.props.selectedTab !== CloneRepositoryTab.Generic) {
-      this.setGitHubTabState({ filterText }, this.props.selectedTab)
-    }
+    this.setGitHubTabState({ filterText })
   }
 
   private onSelectionChanged = (selectedItem: IAPIRepository | null) => {
-    if (this.props.selectedTab !== CloneRepositoryTab.Generic) {
-      this.setGitHubTabState({ selectedItem }, this.props.selectedTab)
-      this.updateUrl(selectedItem === null ? '' : selectedItem.clone_url)
-    }
+    this.setGitHubTabState({ selectedItem })
+    this.updateUrl(selectedItem === null ? '' : selectedItem.clone_url)
   }
 
   private validatePath = async () => {
@@ -492,7 +622,7 @@ export class CloneRepository extends React.Component<
         this.setSelectedTabState({ error: null })
       }
     } else {
-      const pathValidation = await this.validateEmptyFolder(path)
+      const pathValidation = await this.validateClonePath(path)
 
       // We only care about the result if the path hasn't
       // changed since we went async
@@ -504,7 +634,10 @@ export class CloneRepository extends React.Component<
   }
 
   private onChooseDirectory = async () => {
-    if (enableSaveDialogOnCloneRepository()) {
+    // We received feedback (#12812) that using the save dialog is confusing on
+    // windows due to appearing to require a file selection. This is not the case
+    // on mac where it more clearly shows directory creation.
+    if (__DARWIN__) {
       return this.onChooseWithSaveDialog()
     }
 
@@ -512,20 +645,20 @@ export class CloneRepository extends React.Component<
   }
 
   private onChooseWithOpenDialog = async (): Promise<string | undefined> => {
-    const window = remote.getCurrentWindow()
-    const { filePaths } = await remote.dialog.showOpenDialog(window, {
+    const path = await showOpenDialog({
       properties: ['createDirectory', 'openDirectory'],
     })
 
-    if (filePaths.length === 0) {
+    if (path === null) {
       return
     }
 
     const tabState = this.getSelectedTabState()
     const lastParsedIdentifier = tabState.lastParsedIdentifier
-    const directory = lastParsedIdentifier
-      ? Path.join(filePaths[0], lastParsedIdentifier.name)
-      : filePaths[0]
+    const safeName = lastParsedIdentifier
+      ? sanitizeCloneName(lastParsedIdentifier.name)
+      : null
+    const directory = safeName ? Path.join(path, safeName) : path
 
     this.setSelectedTabState(
       { path: directory, error: null },
@@ -536,24 +669,23 @@ export class CloneRepository extends React.Component<
   }
 
   private onChooseWithSaveDialog = async (): Promise<string | undefined> => {
-    const window = remote.getCurrentWindow()
     const tabState = this.getSelectedTabState()
 
-    const { canceled, filePath } = await remote.dialog.showSaveDialog(window, {
+    const path = await showSaveDialog({
       buttonLabel: 'Select',
       nameFieldLabel: 'Clone As:',
       showsTagField: false,
-      defaultPath: tabState.path,
+      defaultPath: tabState.path ?? '',
       properties: ['createDirectory'],
     })
 
-    if (canceled || filePath == null) {
+    if (path == null) {
       return
     }
 
-    this.setSelectedTabState({ path: filePath, error: null }, this.validatePath)
+    this.setSelectedTabState({ path, error: null }, this.validatePath)
 
-    return filePath
+    return path
   }
 
   private updateUrl = async (url: string) => {
@@ -561,18 +693,27 @@ export class CloneRepository extends React.Component<
     const tabState = this.getSelectedTabState()
     const lastParsedIdentifier = tabState.lastParsedIdentifier
 
+    // If there is no path yet, just update the url
+    if (tabState.path === null) {
+      this.setSelectedTabState({ url }, this.validatePath)
+      return
+    }
+
+    const safeName = parsed ? sanitizeCloneName(parsed.name) : null
+
     let newPath: string
 
+    const dirPath = tabState.path
     if (lastParsedIdentifier) {
-      if (parsed) {
-        newPath = Path.join(Path.dirname(tabState.path), parsed.name)
+      if (safeName) {
+        newPath = Path.join(Path.dirname(dirPath), safeName)
       } else {
-        newPath = Path.dirname(tabState.path)
+        newPath = Path.dirname(dirPath)
       }
-    } else if (parsed) {
-      newPath = Path.join(tabState.path, parsed.name)
+    } else if (safeName) {
+      newPath = Path.join(dirPath, safeName)
     } else {
-      newPath = tabState.path
+      newPath = dirPath
     }
 
     this.setSelectedTabState(
@@ -585,8 +726,33 @@ export class CloneRepository extends React.Component<
     )
   }
 
-  private async validateEmptyFolder(path: string): Promise<null | Error> {
+  /** Validate the destination before cloning can create files in it. */
+  private async validateClonePath(path: string | null): Promise<null | Error> {
+    if (path === null) {
+      return new Error(
+        'Unable to read path on disk. Please check the path and try again.'
+      )
+    }
+
+    if (
+      __DARWIN__ &&
+      Path.basename(Path.resolve(path)).toLowerCase().endsWith('.app')
+    ) {
+      return new Error(
+        'The local path cannot end in .app on macOS. Choose a different folder name to avoid creating an application bundle.'
+      )
+    }
+
     try {
+      const canonical = await canonicalMutationPath(path)
+      if (this.getSelectedTabState().path === path) {
+        this.validatedClonePath = { path, canonical }
+      }
+      if (isRepositoryAffectedByAssistedCommit(canonical)) {
+        return new Error(
+          'Finish or cancel the assisted commit run before cloning into this directory.'
+        )
+      }
       const directoryFiles = await readdir(path)
 
       if (directoryFiles.length === 0) {
@@ -623,19 +789,19 @@ export class CloneRepository extends React.Component<
    * the repository alias to the clone URL and the repository default branch,
    * if possible.
    */
-  private async resolveCloneInfo(): Promise<IAPIRepositoryCloneInfo | null> {
-    const { url, lastParsedIdentifier } = this.getSelectedTabState()
+  private async resolveCloneInfo(
+    request: ICloneRequest
+  ): Promise<IAPIRepositoryCloneInfo | null> {
+    const { tab, url, lastParsedIdentifier, account } = request
 
-    const accounts = new Array<Account>()
-    if (this.props.dotComAccount) {
-      accounts.push(this.props.dotComAccount)
+    if (url.endsWith('.wiki.git')) {
+      return { url }
     }
 
-    if (this.props.enterpriseAccount) {
-      accounts.push(this.props.enterpriseAccount)
+    if (tab === CloneRepositoryTab.Generic) {
+      return resolveURLCloneInfo(url, this.props.accounts)
     }
 
-    const account = await findAccountForRemoteURL(url, accounts)
     if (lastParsedIdentifier !== null && account !== null) {
       const api = API.fromAccount(account)
       const { owner, name } = lastParsedIdentifier
@@ -662,9 +828,27 @@ export class CloneRepository extends React.Component<
   private clone = async () => {
     this.setState({ loading: true })
 
-    const cloneInfo = await this.resolveCloneInfo()
-    const { path } = this.getSelectedTabState()
+    // Capture what's being cloned before going async, so that changes made
+    // while the clone is being prepared can't mix one account's repository
+    // with another account.
+    const request = this.getCloneRequest()
+    const { path } = request
 
+    if (path == null) {
+      const error = new Error(`Directory could not be created at this path.`)
+      this.setState({ loading: false })
+      this.setSelectedTabState({ error })
+      return
+    }
+
+    const pathError = await this.validateClonePath(path)
+    if (pathError !== null) {
+      this.setState({ loading: false })
+      this.setSelectedTabState({ error: pathError })
+      return
+    }
+
+    const cloneInfo = await this.resolveCloneInfo(request)
     if (!cloneInfo) {
       const error = new Error(
         `We couldn't find that repository. Check that you are logged in, the network is accessible, and the URL or repository alias are spelled correctly.`
@@ -676,8 +860,15 @@ export class CloneRepository extends React.Component<
 
     const { url, defaultBranch } = cloneInfo
 
+    const currentPathError = await this.validateClonePath(path)
+    if (currentPathError !== null) {
+      this.setState({ loading: false })
+      this.setSelectedTabState({ error: currentPathError })
+      return
+    }
+    this.props.dispatcher.closeFoldout(FoldoutType.Repository)
     try {
-      this.cloneImpl(url.trim(), path, defaultBranch)
+      this.cloneImpl(request, url.trim(), path, defaultBranch)
     } catch (e) {
       log.error(`CloneRepository: clone failed to complete to ${path}`, e)
       this.setState({ loading: false })
@@ -685,8 +876,37 @@ export class CloneRepository extends React.Component<
     }
   }
 
-  private cloneImpl(url: string, path: string, defaultBranch?: string) {
-    this.props.dispatcher.clone(url, path, { defaultBranch })
+  /** Snapshot the selected tab's clone request. */
+  private getCloneRequest(): ICloneRequest {
+    const tab = this.props.selectedTab
+    const { url, lastParsedIdentifier, path } = this.getTabState(tab)
+    return {
+      tab,
+      url,
+      lastParsedIdentifier,
+      path,
+      account:
+        tab === CloneRepositoryTab.GitHub ? this.getSelectedAccount() : null,
+    }
+  }
+
+  private cloneImpl(
+    request: ICloneRequest,
+    url: string,
+    path: string,
+    defaultBranch?: string
+  ) {
+    const { account } = request
+    this.props.dispatcher.clone(
+      url,
+      path,
+      account === null
+        ? { defaultBranch }
+        : {
+            defaultBranch,
+            account: { endpoint: account.endpoint, login: account.login },
+          }
+    )
     this.props.onDismissed()
 
     setDefaultDir(Path.resolve(path, '..'))

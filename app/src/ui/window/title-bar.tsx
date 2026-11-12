@@ -1,16 +1,30 @@
 import * as React from 'react'
 import memoizeOne from 'memoize-one'
-import { remote } from 'electron'
 import { WindowState } from '../../lib/window-state'
 import { WindowControls } from './window-controls'
-import { Octicon, OcticonSymbol } from '../octicons'
-import { isMacOSBigSurOrLater } from '../../lib/get-os'
+import { Octicon } from '../octicons/octicon'
+import * as octicons from '../octicons/octicons.generated'
+import { isMacOSBigSurOrLater, isMacOSTahoeOrLater } from '../../lib/get-os'
+import {
+  getAppleActionOnDoubleClick,
+  isWindowMaximized,
+  maximizeWindow,
+  minimizeWindow,
+  restoreWindow,
+} from '../main-process-proxy'
 
 /** Get the height (in pixels) of the title bar depending on the platform */
 export function getTitleBarHeight() {
   if (__DARWIN__) {
-    // Big Sur has taller title bars, see #10980
-    return isMacOSBigSurOrLater() ? 26 : 22
+    if (isMacOSTahoeOrLater()) {
+      // Tahoe also has taller title bars, see #21135
+      return 32
+    } else if (isMacOSBigSurOrLater()) {
+      // Big Sur has taller title bars, see #10980
+      return 26
+    } else {
+      return 22
+    }
   }
 
   return 28
@@ -20,7 +34,7 @@ interface ITitleBarProps {
   /**
    * The current state of the Window, ie maximized, minimized full-screen etc.
    */
-  readonly windowState: WindowState
+  readonly windowState: WindowState | null
 
   /** Whether we should hide the toolbar (and show inverted window controls) */
   readonly titleBarStyle: 'light' | 'dark'
@@ -50,24 +64,25 @@ export class TitleBar extends React.Component<ITitleBarProps> {
     return style
   })
 
-  private onTitlebarDoubleClickDarwin = () => {
-    const actionOnDoubleClick = remote.systemPreferences.getUserDefault(
-      'AppleActionOnDoubleClick',
-      'string'
-    )
-    const mainWindow = remote.getCurrentWindow()
+  private onTitlebarDoubleClickDarwin = async () => {
+    const actionOnDoubleClick = await getAppleActionOnDoubleClick()
 
+    // Electron.AppleActionOnDoubleClickPre should only be 'Minimize',
+    // 'Maximize', or 'None'. But, if a user deletes their action on double
+    // click setting via terminal, then it returns an empty string. The macOs
+    // convention is to treat this as the default behavior of 'Maximize'.
     switch (actionOnDoubleClick) {
-      case 'Maximize':
-        if (mainWindow.isMaximized()) {
-          mainWindow.unmaximize()
-        } else {
-          mainWindow.maximize()
-        }
-        break
       case 'Minimize':
-        mainWindow.minimize()
+        minimizeWindow()
         break
+      case 'None':
+        return
+      default:
+        if (await isWindowMaximized()) {
+          restoreWindow()
+        } else {
+          maximizeWindow()
+        }
     }
   }
 
@@ -95,7 +110,7 @@ export class TitleBar extends React.Component<ITitleBarProps> {
       this.props.titleBarStyle === 'light' ? 'light-title-bar' : ''
 
     const appIcon = this.props.showAppIcon ? (
-      <Octicon className="app-icon" symbol={OcticonSymbol.markGithub} />
+      <Octicon className="app-icon" symbol={octicons.markGithub} />
     ) : null
 
     const onTitlebarDoubleClick = __DARWIN__

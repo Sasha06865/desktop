@@ -1,43 +1,26 @@
 import pLimit from 'p-limit'
 import QuickLRU from 'quick-lru'
 
-import { Account } from '../../models/account'
-import { AccountsStore } from './accounts-store'
+import { Disposable } from 'event-kit'
+import xor from 'lodash/xor'
+import { Account, getAccountKey } from '../../models/account'
 import { GitHubRepository } from '../../models/github-repository'
+import { Repository } from '../../models/repository'
+import { API, IAPICheckSuite } from '../api'
+import { getAccountForRepository } from '../get-account-for-repository'
 import {
-  API,
-  IAPIRefStatusItem,
-  IAPIRefCheckRun,
-  APICheckStatus,
-  APICheckConclusion,
-} from '../api'
-import { IDisposable, Disposable } from 'event-kit'
-
-/**
- * A Desktop-specific model closely related to a GitHub API Check Run.
- *
- * The RefCheck object abstracts the difference between the legacy
- * Commit Status objects and the modern Check Runs and unifies them
- * under one common interface. Since all commit statuses can be
- * represented as Check Runs but not all Check Runs can be represented
- * as statuses the model closely aligns with Check Runs.
- */
-export interface IRefCheck {
-  readonly name: string
-  readonly description: string
-  readonly status: APICheckStatus
-  readonly conclusion: APICheckConclusion | null
-}
-
-/**
- * A combined view of all legacy commit statuses as well as
- * check runs for a particular Git reference.
- */
-export interface ICombinedRefCheck {
-  readonly status: APICheckStatus
-  readonly conclusion: APICheckConclusion | null
-  readonly checks: ReadonlyArray<IRefCheck>
-}
+  apiCheckRunToRefCheck,
+  apiStatusToRefCheck,
+  createCombinedCheckFromChecks,
+  getCheckRunActionsWorkflowRuns,
+  getLatestCheckRunsById,
+  getLatestPRWorkflowRunsLogsForCheckRun,
+  ICombinedRefCheck,
+  IRefCheck,
+  manuallySetChecksToPending,
+} from '../ci-checks/ci-checks'
+import { offsetFromNow } from '../offset-from'
+import { AccountsStore } from './accounts-store'
 
 interface ICommitStatusCacheEntry {
   /**
@@ -61,6 +44,9 @@ export type StatusCallBack = (status: ICombinedRefCheck | null) => void
  * ref.
  */
 interface IRefStatusSubscription {
+  /** The local repository whose assigned account authorizes these requests. */
+  readonly localRepository: Repository
+
   /**
    * TThe repository endpoint (for example https://api.github.com for
    * GitHub.com and https://github.corporation.local/api for GHE)
@@ -78,41 +64,37 @@ interface IRefStatusSubscription {
 
   /** One or more callbacks to notify when the commit status is updated */
   readonly callbacks: Set<StatusCallBack>
+
+  /** If provided, we retrieve the actions workflow runs or the checks with this sub */
+  readonly branchName?: string
 }
 
 /**
  * Creates a cache key for a particular ref in a specific repository.
  *
- * Remarks: The cache key is currently the same as the canonical API status
- *          URI but that has no bearing on the functionality, it does, however
- *          help with debugging.
+ * Includes the local repository and assigned identity to prevent sharing
+ * cached results or subscriptions across accounts.
  *
  * @param repository The GitHub repository to use when looking up commit status.
+ * @param localRepository The local repository providing the account assignment.
  * @param ref        The commit ref (can be a SHA or a Git ref) for which to
  *                   fetch status.
  */
-function getCacheKeyForRepository(repository: GitHubRepository, ref: string) {
-  const { endpoint, owner, name } = repository
-  return getCacheKey(endpoint, owner.login, name, ref)
-}
-
-/**
- * Creates a cache key for a particular ref in a specific repository.
- *
- * @param endpoint The repository endpoint (for example https://api.github.com for
- *                 GitHub.com and https://github.corporation.local/api for GHE)
- * @param owner    The repository owner's login (i.e niik for niik/desktop)
- * @param name     The repository name
- * @param ref      The commit ref (can be a SHA or a Git ref) for which to fetch
- *                 status.
- */
-function getCacheKey(
-  endpoint: string,
-  owner: string,
-  name: string,
+function getCacheKeyForRepository(
+  repository: GitHubRepository,
+  localRepository: Repository,
   ref: string
 ) {
-  return `${endpoint}/repos/${owner}/${name}/commits/${ref}`
+  const { endpoint, owner, name } = repository
+  return JSON.stringify([
+    endpoint,
+    owner.login,
+    name,
+    ref,
+    localRepository.id,
+    localRepository.gitHubRepository?.endpoint,
+    localRepository.login,
+  ])
 }
 
 /**
@@ -148,14 +130,14 @@ export class CommitStatusStore {
   private refreshQueued = false
 
   /**
-   * A map keyed on the value of `getCacheKey` containing one object
+   * A map keyed on the value of `getCacheKeyForRepository` containing one object
    * per active subscription which contain all the information required
    * to update a commit status from the API and notify subscribers.
    */
   private readonly subscriptions = new Map<string, IRefStatusSubscription>()
 
   /**
-   * A map keyed on the value of `getCacheKey` containing one object per
+   * A map keyed on the value of `getCacheKeyForRepository` containing one object per
    * reference (repository specific) with the last retrieved commit status
    * for that reference.
    *
@@ -169,7 +151,7 @@ export class CommitStatusStore {
 
   /**
    * A set containing the currently executing (i.e. refreshing) cache
-   * keys (produced by `getCacheKey`).
+   * keys (produced by `getCacheKeyForRepository`).
    */
   private readonly queue = new Set<string>()
 
@@ -185,7 +167,22 @@ export class CommitStatusStore {
   }
 
   private readonly onAccountsUpdated = (accounts: ReadonlyArray<Account>) => {
+    const signedInChanged =
+      xor(this.accounts.map(getAccountKey), accounts.map(getAccountKey))
+        .length > 0
     this.accounts = accounts
+
+    // Accounts are also updated when a token is refreshed or user details
+    // change, which doesn't affect which statuses we're allowed to see.
+    if (!signedInChanged) {
+      return
+    }
+
+    this.cache.clear()
+    for (const subscription of this.subscriptions.values()) {
+      subscription.callbacks.forEach(cb => cb(null))
+    }
+    this.queueRefresh()
   }
 
   /**
@@ -238,7 +235,7 @@ export class CommitStatusStore {
    * API.
    */
   private refreshEligibleSubscriptions() {
-    for (const key of this.subscriptions.keys()) {
+    for (const [key, subscription] of this.subscriptions) {
       // Is it already being worked on?
       if (this.queue.has(key)) {
         continue
@@ -250,12 +247,45 @@ export class CommitStatusStore {
         continue
       }
 
+      const accounts = this.accounts
       this.limit(() => this.refreshSubscription(key))
         .catch(e => log.error('Failed refreshing commit status', e))
-        .then(() => this.queue.delete(key))
+        .then(() => {
+          this.queue.delete(key)
+          if (
+            this.subscriptions.has(key) &&
+            (this.subscriptions.get(key) !== subscription ||
+              this.accounts !== accounts)
+          ) {
+            this.queueRefresh()
+          }
+        })
 
       this.queue.add(key)
     }
+  }
+
+  public async manualRefreshSubscription(
+    repository: GitHubRepository,
+    localRepository: Repository,
+    ref: string,
+    pendingChecks: ReadonlyArray<IRefCheck>
+  ) {
+    const key = getCacheKeyForRepository(repository, localRepository, ref)
+    const subscription = this.subscriptions.get(key)
+
+    if (subscription === undefined) {
+      return
+    }
+
+    const cache = this.cache.get(key)?.check
+    if (cache === undefined || cache === null) {
+      return
+    }
+
+    const check = manuallySetChecksToPending(cache.checks, pendingChecks)
+    this.cache.set(key, { check, fetchedAt: new Date() })
+    subscription.callbacks.forEach(cb => cb(check))
   }
 
   private async refreshSubscription(key: string) {
@@ -268,9 +298,12 @@ export class CommitStatusStore {
     }
 
     const { endpoint, owner, name, ref } = subscription
-    const account = this.accounts.find(a => a.endpoint === endpoint)
+    const account = getAccountForRepository(
+      this.accounts,
+      subscription.localRepository
+    )
 
-    if (account === undefined) {
+    if (account === null || account.endpoint !== endpoint) {
       return
     }
 
@@ -280,6 +313,10 @@ export class CommitStatusStore {
       api.fetchCombinedRefStatus(owner, name, ref),
       api.fetchRefCheckRuns(owner, name, ref),
     ])
+
+    if (!this.isSubscriptionCurrent(key, subscription, account)) {
+      return
+    }
 
     const checks = new Array<IRefCheck>()
 
@@ -304,15 +341,90 @@ export class CommitStatusStore {
     }
 
     if (checkRuns !== null) {
-      const latestCheckRunsByName = getLatestCheckRunsByName(
-        checkRuns.check_runs
-      )
+      const latestCheckRunsByName = getLatestCheckRunsById(checkRuns.check_runs)
       checks.push(...latestCheckRunsByName.map(apiCheckRunToRefCheck))
     }
 
-    const check = createCombinedCheckFromChecks(checks)
+    let checksWithActions = null
+    if (subscription.branchName !== undefined) {
+      checksWithActions = await this.getAndMapActionWorkflowRunsToCheckRuns(
+        checks,
+        key,
+        subscription.branchName
+      )
+    }
+
+    const check = createCombinedCheckFromChecks(checksWithActions ?? checks)
+    if (!this.isSubscriptionCurrent(key, subscription, account)) {
+      return
+    }
     this.cache.set(key, { check, fetchedAt: new Date() })
     subscription.callbacks.forEach(cb => cb(check))
+  }
+
+  private isSubscriptionCurrent(
+    key: string,
+    subscription: IRefStatusSubscription,
+    account: Account
+  ) {
+    return (
+      this.subscriptions.get(key)?.callbacks === subscription.callbacks &&
+      getAccountForRepository(this.accounts, subscription.localRepository) ===
+        account
+    )
+  }
+
+  private async getAndMapActionWorkflowRunsToCheckRuns(
+    checks: ReadonlyArray<IRefCheck>,
+    key: string,
+    branchName: string
+  ): Promise<ReadonlyArray<IRefCheck> | null> {
+    const existingChecks = this.cache.get(key)
+
+    // If the checks haven't changed since last status refresh, don't bother
+    // retrieving actions workflows and they could be stale if this is directly after a rerun
+    if (
+      existingChecks !== undefined &&
+      existingChecks.check !== null &&
+      existingChecks.check.checks.some(c => c.actionsWorkflow !== undefined) &&
+      xor(
+        existingChecks.check.checks.map(cr => cr.id),
+        checks.map(cr => cr.id)
+      ).length === 0
+    ) {
+      // Apply existing action workflow and job steps from cache to refreshed checks
+      const mapped = new Array<IRefCheck>()
+      for (const cr of checks) {
+        const matchingCheck = existingChecks.check.checks.find(
+          c => c.id === cr.id
+        )
+
+        if (matchingCheck === undefined) {
+          // Shouldn't happen, but if it did just keep what we have
+          mapped.push(cr)
+          continue
+        }
+
+        const { actionsWorkflow, actionJobSteps } = matchingCheck
+        mapped.push({
+          ...cr,
+          actionsWorkflow,
+          actionJobSteps,
+        })
+      }
+      return mapped
+    }
+
+    const checkRunsWithActionsWorkflows =
+      await this.getCheckRunActionsWorkflowRuns(key, branchName, checks)
+
+    const checkRunsWithActionsWorkflowJobs =
+      await this.mapActionWorkflowRunsJobsToCheckRuns(
+        key,
+        checkRunsWithActionsWorkflows
+      )
+
+    return checkRunsWithActionsWorkflowJobs
   }
 
   /**
@@ -324,26 +436,67 @@ export class CommitStatusStore {
    */
   public tryGetStatus(
     repository: GitHubRepository,
-    ref: string
+    localRepository: Repository,
+    ref: string,
+    branchName?: string
   ): ICombinedRefCheck | null {
-    const key = getCacheKeyForRepository(repository, ref)
+    if (
+      getAccountForRepository(this.accounts, localRepository)?.endpoint !==
+      repository.endpoint
+    ) {
+      return null
+    }
+    const key = getCacheKeyForRepository(repository, localRepository, ref)
+    if (
+      branchName !== undefined &&
+      this.subscriptions.get(key)?.branchName !== branchName
+    ) {
+      return null
+    }
+
     return this.cache.get(key)?.check ?? null
   }
 
-  private getOrCreateSubscription(repository: GitHubRepository, ref: string) {
-    const key = getCacheKeyForRepository(repository, ref)
+  private getOrCreateSubscription(
+    repository: GitHubRepository,
+    localRepository: Repository,
+    ref: string,
+    branchName?: string
+  ) {
+    const key = getCacheKeyForRepository(repository, localRepository, ref)
     let subscription = this.subscriptions.get(key)
 
     if (subscription !== undefined) {
-      return subscription
+      if (subscription.branchName === branchName) {
+        return subscription
+      }
+
+      const withBranchName = { ...subscription, branchName }
+      this.subscriptions.set(key, withBranchName)
+      const cache = this.cache.get(key)
+      if (cache !== undefined) {
+        this.cache.set(key, {
+          ...cache,
+          // The commit status store is set to only retreive on a refresh
+          // trigger if the subscription has not been fetched for 60 minutes
+          // (cache/api limit). This sets this sub back to 61 so that on next
+          // refresh triggered, it will be reretreived, as this time, it will be
+          // different given the branch name is provided.
+          fetchedAt: new Date(offsetFromNow(-61, 'minutes')),
+        })
+      }
+
+      return withBranchName
     }
 
     subscription = {
+      localRepository,
       endpoint: repository.endpoint,
       owner: repository.owner.login,
       name: repository.name,
       ref,
       callbacks: new Set<StatusCallBack>(),
+      branchName,
     }
 
     this.subscriptions.set(key, subscription)
@@ -355,6 +508,7 @@ export class CommitStatusStore {
    * Subscribe to commit status updates for a particular ref.
    *
    * @param repository The GitHub repository to use when looking up commit status.
+   * @param localRepository The local repository providing the account assignment.
    * @param ref        The commit ref (can be a SHA or a Git ref) for which to
    *                   fetch status.
    * @param callback   A callback which will be invoked whenever the
@@ -362,11 +516,18 @@ export class CommitStatusStore {
    */
   public subscribe(
     repository: GitHubRepository,
+    localRepository: Repository,
     ref: string,
-    callback: StatusCallBack
-  ): IDisposable {
-    const key = getCacheKeyForRepository(repository, ref)
-    const subscription = this.getOrCreateSubscription(repository, ref)
+    callback: StatusCallBack,
+    branchName?: string
+  ): Disposable {
+    const key = getCacheKeyForRepository(repository, localRepository, ref)
+    const subscription = this.getOrCreateSubscription(
+      repository,
+      localRepository,
+      ref,
+      branchName
+    )
 
     subscription.callbacks.add(callback)
     this.queueRefresh()
@@ -378,151 +539,123 @@ export class CommitStatusStore {
       }
     })
   }
-}
 
-/**
- * Convert a legacy API commit status to a fake check run
- */
-function apiStatusToRefCheck(apiStatus: IAPIRefStatusItem): IRefCheck {
-  let state: APICheckStatus
-  let conclusion: APICheckConclusion | null = null
-
-  if (apiStatus.state === 'success') {
-    state = 'completed'
-    conclusion = 'success'
-  } else if (apiStatus.state === 'pending') {
-    state = 'in_progress'
-  } else {
-    state = 'completed'
-    conclusion = 'failure'
-  }
-
-  return {
-    name: apiStatus.context,
-    description: apiStatus.description,
-    status: state,
-    conclusion,
-  }
-}
-
-/**
- * Convert an API check run object to a RefCheck model
- */
-function apiCheckRunToRefCheck(checkRun: IAPIRefCheckRun): IRefCheck {
-  return {
-    name: checkRun.name,
-    description:
-      checkRun?.output.title ?? checkRun.conclusion ?? checkRun.status,
-    status: checkRun.status,
-    conclusion: checkRun.conclusion,
-  }
-}
-
-function createCombinedCheckFromChecks(
-  checks: ReadonlyArray<IRefCheck>
-): ICombinedRefCheck | null {
-  if (checks.length === 0) {
-    // This case is distinct from when we fail to call the API in
-    // that this means there are no checks or statuses so we should
-    // clear whatever info we've got for this ref.
-    return null
-  }
-
-  if (checks.length === 1) {
-    // If we've got exactly one check then we can mirror its status
-    // and conclusion 1-1 without having to create an aggregate status
-    const { status, conclusion } = checks[0]
-    return { status, conclusion, checks }
-  }
-
-  if (checks.some(isIncompleteOrFailure)) {
-    return { status: 'completed', conclusion: 'failure', checks }
-  } else if (checks.every(isSuccess)) {
-    return { status: 'completed', conclusion: 'success', checks }
-  } else {
-    return { status: 'in_progress', conclusion: null, checks }
-  }
-}
-
-/**
- * Whether the check is either incomplete or has failed
- */
-export function isIncompleteOrFailure(check: IRefCheck) {
-  return isIncomplete(check) || isFailure(check)
-}
-
-/**
- * Whether the check is incomplete (timed out, stale or cancelled).
- *
- * The terminology here is confusing and deserves explanation. An
- * incomplete check is a check run that has been started and who's
- * state is 'completed' but it never got to produce a conclusion
- * because it was either cancelled, it timed out, or GitHub marked
- * it as stale.
- */
-export function isIncomplete(check: IRefCheck) {
-  if (check.status === 'completed') {
-    switch (check.conclusion) {
-      case 'timed_out':
-      case 'stale':
-      case 'cancelled':
-        return true
+  /**
+   * Retrieve GitHub Actions workflows and maps them to the check runs if
+   * applicable
+   */
+  private async getCheckRunActionsWorkflowRuns(
+    key: string,
+    branchName: string,
+    checkRuns: ReadonlyArray<IRefCheck>
+  ): Promise<ReadonlyArray<IRefCheck>> {
+    const subscription = this.subscriptions.get(key)
+    if (subscription === undefined) {
+      return checkRuns
     }
-  }
 
-  return false
-}
-
-/** Whether the check has failed (failure or requires action) */
-export function isFailure(check: IRefCheck) {
-  if (check.status === 'completed') {
-    switch (check.conclusion) {
-      case 'failure':
-      case 'action_required':
-        return true
+    const { endpoint, owner, name } = subscription
+    const account = getAccountForRepository(
+      this.accounts,
+      subscription.localRepository
+    )
+    if (account === null || account.endpoint !== endpoint) {
+      return checkRuns
     }
+
+    return getCheckRunActionsWorkflowRuns(
+      account,
+      owner,
+      name,
+      branchName,
+      checkRuns
+    )
   }
 
-  return false
-}
-
-/** Whether the check can be considered successful (success, neutral or skipped) */
-export function isSuccess(check: IRefCheck) {
-  if (check.status === 'completed') {
-    switch (check.conclusion) {
-      case 'success':
-      case 'neutral':
-      case 'skipped':
-        return true
+  /**
+   * Retrieve GitHub Actions job and logs for the check runs.
+   */
+  private async mapActionWorkflowRunsJobsToCheckRuns(
+    key: string,
+    checkRuns: ReadonlyArray<IRefCheck>
+  ): Promise<ReadonlyArray<IRefCheck>> {
+    const subscription = this.subscriptions.get(key)
+    if (subscription === undefined) {
+      return checkRuns
     }
-  }
 
-  return false
-}
+    const { endpoint, owner, name } = subscription
+    const account = getAccountForRepository(
+      this.accounts,
+      subscription.localRepository
+    )
 
-/**
- * In some cases there may be multiple check runs reported for a
- * reference. In that case GitHub.com will pick only the latest
- * run for each check name to present in the PR merge footer and
- * only the latest run counts towards the mergeability of a PR.
- *
- * We use the check suite id as a proxy for determining what's
- * the "latest" of two check runs with the same name.
- */
-function getLatestCheckRunsByName(
-  checkRuns: ReadonlyArray<IAPIRefCheckRun>
-): ReadonlyArray<IAPIRefCheckRun> {
-  const latestCheckRunsByName = new Map<string, IAPIRefCheckRun>()
-
-  for (const checkRun of checkRuns) {
-    const current = latestCheckRunsByName.get(checkRun.name)
-    if (
-      current === undefined ||
-      current.check_suite.id < checkRun.check_suite.id
-    ) {
-      latestCheckRunsByName.set(checkRun.name, checkRun)
+    if (account === null || account.endpoint !== endpoint) {
+      return checkRuns
     }
+
+    const api = API.fromAccount(account)
+
+    return getLatestPRWorkflowRunsLogsForCheckRun(api, owner, name, checkRuns)
   }
 
-  return [...latestCheckRunsByName.values()]
+  public async rerequestCheckSuite(
+    repository: GitHubRepository,
+    localRepository: Repository,
+    checkSuiteId: number
+  ): Promise<boolean> {
+    const { owner, name } = repository
+    const account = getAccountForRepository(this.accounts, localRepository)
+    if (account === null || account.endpoint !== repository.endpoint) {
+      return false
+    }
+
+    const api = API.fromAccount(account)
+    return api.rerequestCheckSuite(owner.login, name, checkSuiteId)
+  }
+
+  public async rerunJob(
+    repository: GitHubRepository,
+    localRepository: Repository,
+    jobId: number
+  ): Promise<boolean> {
+    const { owner, name } = repository
+    const account = getAccountForRepository(this.accounts, localRepository)
+    if (account === null || account.endpoint !== repository.endpoint) {
+      return false
+    }
+
+    const api = API.fromAccount(account)
+    return api.rerunJob(owner.login, name, jobId)
+  }
+
+  public async rerunFailedJobs(
+    repository: GitHubRepository,
+    localRepository: Repository,
+    workflowRunId: number
+  ): Promise<boolean> {
+    const { owner, name } = repository
+    const account = getAccountForRepository(this.accounts, localRepository)
+    if (account === null || account.endpoint !== repository.endpoint) {
+      return false
+    }
+
+    const api = API.fromAccount(account)
+    return api.rerunFailedJobs(owner.login, name, workflowRunId)
+  }
+
+  public async fetchCheckSuite(
+    repository: GitHubRepository,
+    localRepository: Repository,
+    checkSuiteId: number
+  ): Promise<IAPICheckSuite | null> {
+    const { owner, name } = repository
+    const account = getAccountForRepository(this.accounts, localRepository)
+    if (account === null || account.endpoint !== repository.endpoint) {
+      return null
+    }
+
+    const api = API.fromAccount(account)
+    return api.fetchCheckSuite(owner.login, name, checkSuiteId)
+  }
 }

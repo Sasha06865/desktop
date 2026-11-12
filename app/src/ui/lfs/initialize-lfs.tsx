@@ -35,8 +35,9 @@ export class InitializeLFS extends React.Component<IInitializeLFSProps, {}> {
       <Dialog
         id="initialize-lfs"
         title="Initialize Git LFS"
-        onDismissed={this.props.onDismissed}
+        backdropDismissable={false}
         onSubmit={this.onInitialize}
+        onDismissed={this.props.onDismissed}
       >
         <DialogContent>{this.renderRepositories()}</DialogContent>
 
@@ -44,6 +45,7 @@ export class InitializeLFS extends React.Component<IInitializeLFSProps, {}> {
           <OkCancelButtonGroup
             okButtonText="Initialize Git LFS"
             cancelButtonText={__DARWIN__ ? 'Not Now' : 'Not now'}
+            onCancelButtonClick={this.props.onDismissed}
           />
         </DialogFooter>
       </Dialog>

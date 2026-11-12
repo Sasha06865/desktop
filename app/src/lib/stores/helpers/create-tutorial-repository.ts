@@ -1,7 +1,7 @@
 import * as Path from 'path'
 
 import { Account } from '../../../models/account'
-import { writeFile, pathExists, ensureDir } from 'fs-extra'
+import { mkdir, writeFile } from 'fs/promises'
 import { API } from '../../api'
 import { APIError } from '../../http'
 import {
@@ -9,11 +9,10 @@ import {
   PushProgressParser,
 } from '../../progress'
 import { git } from '../../git'
-import { friendlyEndpointName } from '../../friendly-endpoint-name'
 import { IRemote } from '../../../models/remote'
-import { merge } from '../../merge'
-import { withTrampolineEnvForRemoteOperation } from '../../trampoline/trampoline-environment'
 import { getDefaultBranch } from '../../helpers/default-branch'
+import { envForRemoteOperation } from '../../git/environment'
+import { pathExists } from '../../path-exists'
 
 const nl = __WIN32__ ? '\r\n' : '\n'
 const InitialReadmeContents =
@@ -48,9 +47,7 @@ async function createAPIRepository(account: Account, name: string) {
         ) {
           throw new Error(
             'You already have a repository named ' +
-              `"${name}" on your account at ${friendlyEndpointName(
-                account
-              )}.\n\n` +
+              `"${name}" on your account at ${account.friendlyEndpoint}.\n\n` +
               'Please delete the repository and try again.'
           )
         }
@@ -68,11 +65,16 @@ async function pushRepo(
   remoteBranchName: string,
   progressCb: (title: string, value: number, description?: string) => void
 ) {
-  const pushTitle = `Pushing repository to ${friendlyEndpointName(account)}`
+  const pushTitle = `Pushing repository to ${account.friendlyEndpoint}`
   progressCb(pushTitle, 0)
 
   const pushOpts = await executionOptionsWithProgress(
-    {},
+    {
+      env: await envForRemoteOperation(remote.url),
+      // The tutorial repository isn't added to Desktop until after it's been
+      // pushed, so its account can't be resolved from its path yet.
+      fallbackAccount: { endpoint: account.endpoint, login: account.login },
+    },
     new PushProgressParser(),
     progress => {
       if (progress.kind === 'progress') {
@@ -82,13 +84,7 @@ async function pushRepo(
   )
 
   const args = ['push', '-u', remote.name, remoteBranchName]
-
-  await withTrampolineEnvForRemoteOperation(account, remote.url, env => {
-    return git(args, path, 'tutorial:push', {
-      ...pushOpts,
-      env: merge(pushOpts.env, env),
-    })
-  })
+  await git(args, path, 'tutorial:push', pushOpts)
 }
 
 /**
@@ -109,8 +105,7 @@ export async function createTutorialRepository(
   path: string,
   progressCb: (title: string, value: number, description?: string) => void
 ) {
-  const endpointName = friendlyEndpointName(account)
-  progressCb(`Creating repository on ${endpointName}`, 0)
+  progressCb(`Creating repository on ${account.friendlyEndpoint}`, 0)
 
   if (await pathExists(path)) {
     throw new Error(
@@ -123,7 +118,7 @@ export async function createTutorialRepository(
   const branch = repo.default_branch ?? (await getDefaultBranch())
   progressCb('Initializing local repository', 0.2)
 
-  await ensureDir(path)
+  await mkdir(path, { recursive: true })
 
   await git(
     ['-c', `init.defaultBranch=${branch}`, 'init'],

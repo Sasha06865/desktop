@@ -1,7 +1,7 @@
 import * as Path from 'path'
 import * as Fs from 'fs'
-import fileUriToPath from 'file-uri-to-path'
 import sourceMapSupport from 'source-map-support'
+import { fileURLToPath } from 'url'
 
 /**
  * This array tells the source map logic which files that we can expect to
@@ -23,7 +23,7 @@ function retrieveSourceMap(source: string) {
 
   // We get a file uri when we're inside a renderer, convert to a path
   if (source.startsWith('file://')) {
-    source = fileUriToPath(source)
+    source = fileURLToPath(source)
   }
 
   // We store our source maps right next to the bundle
@@ -37,7 +37,7 @@ function retrieveSourceMap(source: string) {
       if (xhr.readyState === 4 && xhr.status === 200) {
         return { url: Path.basename(path), map: xhr.responseText }
       }
-    } catch (error) {
+    } catch {
       return null
     }
     return null
@@ -56,7 +56,7 @@ function retrieveSourceMap(source: string) {
     // eslint-disable-next-line no-sync
     const map = Fs.readFileSync(path, 'utf8')
     return { url: Path.basename(path), map }
-  } catch (error) {
+  } catch {
     return null
   }
 }
@@ -105,11 +105,46 @@ export function enableSourceMaps() {
  * Make a copy of the error with a source-mapped stack trace. If it couldn't
  * perform the source mapping, it'll use the original error stack.
  */
-export function withSourceMappedStack(error: Error): Error {
+export function withSourceMappedStack(error: unknown): Error {
+  // Guard against `throw "Foo"` which is totally a thing that can happen
+  if (typeof error === 'string') {
+    return {
+      name: 'StringError',
+      message: error,
+    }
+  }
+
+  let message
+
+  if (error && typeof error === 'object' && 'message' in error) {
+    if (error.message === null) {
+      message = 'null'
+    } else if (error.message === undefined) {
+      message = 'undefined'
+    } else if (typeof error.message === 'string') {
+      message = error.message
+    } else if (typeof error.message === 'object') {
+      message = JSON.stringify(
+        error.message,
+        Object.getOwnPropertyNames(error.message)
+      )
+    } else {
+      message = `${error.message}`
+    }
+  } else {
+    message = '[Unknown]'
+  }
+
   return {
-    name: error.name,
-    message: error.message,
-    stack: sourceMappedStackTrace(error),
+    name:
+      error &&
+      typeof error === 'object' &&
+      'name' in error &&
+      typeof error.name === 'string'
+        ? error.name
+        : '[Unknown]',
+    message,
+    stack: error instanceof Error ? sourceMappedStackTrace(error) : undefined,
   }
 }
 

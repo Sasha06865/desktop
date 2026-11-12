@@ -1,9 +1,10 @@
-import { GitProcess } from 'dugite'
-import * as FSE from 'fs-extra'
+import { exec } from 'dugite'
+import { writeFile } from 'fs/promises'
 import * as Path from 'path'
+import { TestContext } from 'node:test'
 
 import { Repository } from '../../src/models/repository'
-import { mkdirSync } from './temp'
+import { createTempDirectory } from './temp'
 
 type TreeEntry = {
   /** The relative path of the file in the repository */
@@ -31,14 +32,12 @@ type Tree = {
  * push/pull/fetch operations can be tested without requiring the network.
  */
 export async function cloneRepository(
+  t: TestContext,
   repository: Repository
 ): Promise<Repository> {
-  const newDirectory = mkdirSync('desktop-git-clone-')
+  const newDirectory = await createTempDirectory(t)
 
-  await GitProcess.exec(
-    ['clone', repository.path, '--', newDirectory],
-    __dirname
-  )
+  await exec(['clone', repository.path, '--', newDirectory], __dirname)
 
   return new Repository(newDirectory, -2, null, false)
 }
@@ -52,15 +51,15 @@ export async function makeCommit(repository: Repository, tree: Tree) {
   for (const entry of tree.entries) {
     const fullPath = Path.join(repository.path, entry.path)
     if (entry.contents === null) {
-      await GitProcess.exec(['rm', entry.path], repository.path)
+      await exec(['rm', entry.path], repository.path)
     } else {
-      await FSE.writeFile(fullPath, entry.contents)
-      await GitProcess.exec(['add', entry.path], repository.path)
+      await writeFile(fullPath, entry.contents)
+      await exec(['add', entry.path], repository.path)
     }
   }
 
   const message = tree.commitMessage || 'commit'
-  await GitProcess.exec(['commit', '-m', message], repository.path)
+  await exec(['commit', '-m', message], repository.path)
 }
 
 export async function createBranch(
@@ -68,14 +67,11 @@ export async function createBranch(
   branch: string,
   startPoint: string
 ) {
-  const result = await GitProcess.exec(
-    ['rev-parse', '--verify', branch],
-    repository.path
-  )
+  const result = await exec(['rev-parse', '--verify', branch], repository.path)
 
   if (result.exitCode === 128) {
     // ref does not exists, checkout and create the branch
-    await GitProcess.exec(['branch', branch, startPoint], repository.path)
+    await exec(['branch', branch, startPoint], repository.path)
   } else {
     throw new Error(
       `Branch ${branch} already exists and resolves to '${result.stdout}'`
@@ -84,26 +80,24 @@ export async function createBranch(
 }
 
 export async function switchTo(repository: Repository, branch: string) {
-  const result = await GitProcess.exec(
-    ['rev-parse', '--verify', branch],
-    repository.path
-  )
+  const result = await exec(['rev-parse', '--verify', branch], repository.path)
 
   if (result.exitCode === 128) {
     // ref does not exists, checkout and create the branch
-    await GitProcess.exec(['checkout', '-b', branch], repository.path)
+    await exec(['checkout', '-b', branch], repository.path)
   } else {
     // just switch to the branch
-    await GitProcess.exec(['checkout', branch], repository.path)
+    await exec(['checkout', branch], repository.path)
   }
 }
 
 export async function cloneLocalRepository(
+  t: TestContext,
   repository: Repository
 ): Promise<Repository> {
-  const repoPath = mkdirSync('blank-folder')
+  const repoPath = await createTempDirectory(t)
   const args = ['clone', '--', repository.path, repoPath]
-  const result = await GitProcess.exec(args, repository.path)
+  const result = await exec(args, repository.path)
 
   if (result.exitCode === 128) {
     throw new Error(JSON.stringify(result))

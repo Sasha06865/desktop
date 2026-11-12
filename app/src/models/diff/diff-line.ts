@@ -36,6 +36,17 @@ export class DiffLine {
 
   /** The content of the line, i.e., without the line type marker. */
   public get content(): string {
-    return this.text.substr(1)
+    return this.text.substring(1)
+  }
+
+  public equals(other: DiffLine) {
+    return (
+      this.text === other.text &&
+      this.type === other.type &&
+      this.originalLineNumber === other.originalLineNumber &&
+      this.oldLineNumber === other.oldLineNumber &&
+      this.newLineNumber === other.newLineNumber &&
+      this.noTrailingNewLine === other.noTrailingNewLine
+    )
   }
 }

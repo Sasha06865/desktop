@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Account } from '../../models/account'
+import { Account, isDotComAccount } from '../../models/account'
 import { PreferencesTab } from '../../models/preferences'
 import { Dispatcher } from '../dispatcher'
 import { TabBar, TabBarType } from '../tab-bar'
@@ -27,7 +27,8 @@ import {
   UncommittedChangesStrategy,
   defaultUncommittedChangesStrategy,
 } from '../../models/uncommitted-changes-strategy'
-import { Octicon, OcticonSymbol } from '../octicons'
+import { Octicon } from '../octicons'
+import * as octicons from '../octicons/octicons.generated'
 import {
   isConfigFileLockError,
   parseConfigLockFilePathFromError,
@@ -39,23 +40,93 @@ import {
 } from '../../lib/helpers/default-branch'
 import { Prompts } from './prompts'
 import { Repository } from '../../models/repository'
+import { Notifications } from './notifications'
+import { Accessibility } from './accessibility'
+import { CopilotPreferences } from './copilot'
+import type {
+  CopilotFeature,
+  CopilotModelsByAccount,
+  CopilotModelSelectionsByAccount,
+  CopilotQuotaSnapshotsByAccount,
+} from '../../lib/stores/copilot-store'
+import { getCopilotAccountCacheKey } from '../../lib/stores/copilot-store'
+import type { IBYOKProvider } from '../../lib/copilot/byok'
+import { PopupType } from '../../models/popup'
+import {
+  ICustomIntegration,
+  TargetPathArgument,
+  isValidCustomIntegration,
+} from '../../lib/custom-integration'
+import {
+  defaultGitHookEnvShell,
+  defaultHooksEnvEnabledValue,
+  getCacheHooksEnv,
+  getGitHookEnvShell,
+  getHooksEnvEnabled,
+  setCacheHooksEnv,
+  setGitHookEnvShell,
+  setHooksEnvEnabled,
+} from '../../lib/hooks/config'
+import { enableCopilotSdkCommitMessageGeneration } from '../../lib/feature-flag'
+import {
+  DateFormat,
+  TimeFormat,
+  INumberFormat,
+  getPreferAbsoluteDates,
+  getDateFormatPreference,
+  getTimeFormatPreference,
+  getNumberFormatPreference,
+  setDateFormatPreference,
+  setTimeFormatPreference,
+  setNumberFormatPreference,
+} from '../../models/formatting-preferences'
+import {
+  enableCopilotAppHandoff,
+  enableFormattingPreferences,
+} from '../../lib/feature-flag'
+import { validateCopilotAppPath } from '../../lib/copilot-app'
 
 interface IPreferencesProps {
   readonly dispatcher: Dispatcher
-  readonly dotComAccount: Account | null
-  readonly enterpriseAccount: Account | null
+  readonly accounts: ReadonlyArray<Account>
   readonly repository: Repository | null
   readonly onDismissed: () => void
+  readonly useWindowsOpenSSH: boolean
+  readonly showCommitLengthWarning: boolean
+  readonly notificationsEnabled: boolean
   readonly optOutOfUsageTracking: boolean
+  readonly useExternalCredentialHelper: boolean
   readonly initialSelectedTab?: PreferencesTab
   readonly confirmRepositoryRemoval: boolean
   readonly confirmDiscardChanges: boolean
+  readonly confirmDiscardChangesPermanently: boolean
+  readonly confirmDiscardStash: boolean
+  readonly confirmCheckoutCommit: boolean
   readonly confirmForcePush: boolean
+  readonly confirmUndoCommit: boolean
+  readonly askForConfirmationOnCommitFilteredChanges: boolean
+  readonly confirmCommitMessageOverride: boolean
+  readonly confirmWorktreeRemoval: boolean
   readonly uncommittedChangesStrategy: UncommittedChangesStrategy
   readonly selectedExternalEditor: string | null
   readonly selectedShell: Shell
   readonly selectedTheme: ApplicationTheme
+  readonly selectedTabSize: number
+  readonly alwaysShowWorktreeList: boolean
+  readonly useCustomEditor: boolean
+  readonly customEditor: ICustomIntegration | null
+  readonly useCustomShell: boolean
+  readonly customShell: ICustomIntegration | null
+  readonly copilotAppPath: string | null
   readonly repositoryIndicatorsEnabled: boolean
+  readonly onEditGlobalGitConfig: () => void
+  readonly underlineLinks: boolean
+  readonly showDiffCheckMarks: boolean
+  readonly selectedCopilotModelsByAccount: CopilotModelSelectionsByAccount
+  readonly copilotModelsByAccount: CopilotModelsByAccount
+  readonly copilotQuotaSnapshotsByAccount: CopilotQuotaSnapshotsByAccount
+  readonly byokProviders: ReadonlyArray<IBYOKProvider>
+  readonly alwaysUseCopilotForConflictResolution: boolean
 }
 
 interface IPreferencesState {
@@ -67,15 +138,33 @@ interface IPreferencesState {
   readonly initialCommitterEmail: string | null
   readonly initialDefaultBranch: string | null
   readonly disallowedCharactersMessage: string | null
+  readonly useWindowsOpenSSH: boolean
+  readonly showCommitLengthWarning: boolean
+  readonly notificationsEnabled: boolean
   readonly optOutOfUsageTracking: boolean
+  readonly useExternalCredentialHelper: boolean
   readonly confirmRepositoryRemoval: boolean
   readonly confirmDiscardChanges: boolean
+  readonly confirmDiscardChangesPermanently: boolean
+  readonly confirmDiscardStash: boolean
+  readonly confirmCheckoutCommit: boolean
   readonly confirmForcePush: boolean
+  readonly confirmUndoCommit: boolean
+  readonly askForConfirmationOnCommitFilteredChanges: boolean
+  readonly confirmCommitMessageOverride: boolean
+  readonly confirmWorktreeRemoval: boolean
   readonly uncommittedChangesStrategy: UncommittedChangesStrategy
   readonly availableEditors: ReadonlyArray<string>
+  readonly useCustomEditor: boolean
+  readonly customEditor: ICustomIntegration
+  readonly useCustomShell: boolean
+  readonly customShell: ICustomIntegration
+  readonly copilotAppPath: string
+  readonly copilotAppPathError?: string
   readonly selectedExternalEditor: string | null
   readonly availableShells: ReadonlyArray<Shell>
   readonly selectedShell: Shell
+
   /**
    * If unable to save Git configuration values (name, email)
    * due to an existing configuration lock file this property
@@ -85,6 +174,40 @@ interface IPreferencesState {
    */
   readonly existingLockFilePath?: string
   readonly repositoryIndicatorsEnabled: boolean
+
+  readonly initiallySelectedTheme: ApplicationTheme
+  readonly initiallySelectedTabSize: number
+  readonly alwaysShowWorktreeList: boolean
+
+  readonly isLoadingGitConfig: boolean
+
+  readonly underlineLinks: boolean
+
+  readonly showDiffCheckMarks: boolean
+
+  readonly selectedGitTabIndex?: number
+  readonly enableGitHookEnv: boolean | undefined
+  readonly cacheGitHookEnv: boolean | undefined
+  readonly selectedGitHookEnvShell: string | undefined
+  // Whether the preferences related to Git hooks environment have been changed
+  readonly hooksPreferencesDirty: boolean
+
+  readonly selectedCopilotModelsByAccount: CopilotModelSelectionsByAccount
+  readonly alwaysUseCopilotForConflictResolution: boolean
+  readonly selectedDateFormat?: DateFormat
+  readonly selectedTimeFormat?: TimeFormat
+  readonly selectedNumberFormat?: INumberFormat
+  readonly preferAbsoluteDates?: boolean
+}
+
+/**
+ * Default custom integration values to coalesce with. We can't make up a path
+ * nor a bundle ID, but we can at least provide a default argument.
+ */
+const DefaultCustomIntegration: ICustomIntegration = {
+  path: '',
+  bundleID: undefined,
+  arguments: TargetPathArgument,
 }
 
 /** The app-level preferences component. */
@@ -105,15 +228,48 @@ export class Preferences extends React.Component<
       initialDefaultBranch: null,
       disallowedCharactersMessage: null,
       availableEditors: [],
+      useCustomEditor: this.props.useCustomEditor,
+      customEditor: this.props.customEditor ?? DefaultCustomIntegration,
+      useCustomShell: this.props.useCustomShell,
+      customShell: this.props.customShell ?? DefaultCustomIntegration,
+      copilotAppPath: this.props.copilotAppPath ?? '',
+      useWindowsOpenSSH: false,
+      showCommitLengthWarning: false,
+      notificationsEnabled: true,
       optOutOfUsageTracking: false,
+      useExternalCredentialHelper: false,
       confirmRepositoryRemoval: false,
       confirmDiscardChanges: false,
+      confirmDiscardChangesPermanently: false,
+      confirmDiscardStash: false,
+      confirmCheckoutCommit: false,
       confirmForcePush: false,
+      confirmUndoCommit: false,
+      askForConfirmationOnCommitFilteredChanges: false,
+      confirmCommitMessageOverride: true,
+      confirmWorktreeRemoval: true,
       uncommittedChangesStrategy: defaultUncommittedChangesStrategy,
       selectedExternalEditor: this.props.selectedExternalEditor,
       availableShells: [],
       selectedShell: this.props.selectedShell,
       repositoryIndicatorsEnabled: this.props.repositoryIndicatorsEnabled,
+      initiallySelectedTheme: this.props.selectedTheme,
+      initiallySelectedTabSize: this.props.selectedTabSize,
+      alwaysShowWorktreeList: this.props.alwaysShowWorktreeList,
+      isLoadingGitConfig: true,
+      underlineLinks: this.props.underlineLinks,
+      showDiffCheckMarks: this.props.showDiffCheckMarks,
+      enableGitHookEnv: getHooksEnvEnabled(),
+      cacheGitHookEnv: getCacheHooksEnv(),
+      selectedGitHookEnvShell: getGitHookEnvShell(),
+      hooksPreferencesDirty: false,
+      selectedCopilotModelsByAccount: this.props.selectedCopilotModelsByAccount,
+      alwaysUseCopilotForConflictResolution:
+        this.props.alwaysUseCopilotForConflictResolution,
+      selectedDateFormat: getDateFormatPreference(),
+      selectedTimeFormat: getTimeFormatPreference(),
+      selectedNumberFormat: getNumberFormatPreference(),
+      preferAbsoluteDates: getPreferAbsoluteDates(),
     }
   }
 
@@ -126,7 +282,8 @@ export class Preferences extends React.Component<
     let committerEmail = initialCommitterEmail
 
     if (!committerName || !committerEmail) {
-      const account = this.props.dotComAccount || this.props.enterpriseAccount
+      const { accounts } = this.props
+      const account = accounts.find(isDotComAccount) ?? accounts.at(0)
 
       if (account) {
         if (!committerName) {
@@ -147,8 +304,14 @@ export class Preferences extends React.Component<
       getAvailableShells(),
     ])
 
-    const availableEditors = editors.map(e => e.editor)
-    const availableShells = shells.map(e => e.shell)
+    // Kick off Copilot model list fetch (non-blocking)
+    if (this.isCopilotSdkEnabled) {
+      this.props.dispatcher.fetchCopilotModels()
+      this.props.dispatcher.fetchCopilotQuotaSnapshots()
+    }
+
+    const availableEditors = editors.map(e => e.editor) ?? null
+    const availableShells = shells.map(e => e.shell) ?? null
 
     this.setState({
       committerName,
@@ -157,54 +320,120 @@ export class Preferences extends React.Component<
       initialCommitterName,
       initialCommitterEmail,
       initialDefaultBranch,
+      useWindowsOpenSSH: this.props.useWindowsOpenSSH,
+      showCommitLengthWarning: this.props.showCommitLengthWarning,
+      notificationsEnabled: this.props.notificationsEnabled,
       optOutOfUsageTracking: this.props.optOutOfUsageTracking,
+      useExternalCredentialHelper: this.props.useExternalCredentialHelper,
       confirmRepositoryRemoval: this.props.confirmRepositoryRemoval,
       confirmDiscardChanges: this.props.confirmDiscardChanges,
+      confirmDiscardChangesPermanently:
+        this.props.confirmDiscardChangesPermanently,
+      confirmDiscardStash: this.props.confirmDiscardStash,
+      confirmCheckoutCommit: this.props.confirmCheckoutCommit,
       confirmForcePush: this.props.confirmForcePush,
+      confirmUndoCommit: this.props.confirmUndoCommit,
+      askForConfirmationOnCommitFilteredChanges:
+        this.props.askForConfirmationOnCommitFilteredChanges,
+      confirmCommitMessageOverride: this.props.confirmCommitMessageOverride,
+      confirmWorktreeRemoval: this.props.confirmWorktreeRemoval,
       uncommittedChangesStrategy: this.props.uncommittedChangesStrategy,
       availableShells,
       availableEditors,
+      useCustomEditor: this.props.useCustomEditor,
+      customEditor: this.props.customEditor ?? DefaultCustomIntegration,
+      useCustomShell: this.props.useCustomShell,
+      customShell: this.props.customShell ?? DefaultCustomIntegration,
+      copilotAppPath: this.props.copilotAppPath ?? '',
+      isLoadingGitConfig: false,
     })
+  }
+
+  public componentDidUpdate(prevProps: IPreferencesProps) {
+    if (
+      prevProps.selectedCopilotModelsByAccount !==
+      this.props.selectedCopilotModelsByAccount
+    ) {
+      this.setState({
+        selectedCopilotModelsByAccount:
+          this.props.selectedCopilotModelsByAccount,
+      })
+    }
+
+    if (
+      prevProps.alwaysUseCopilotForConflictResolution !==
+      this.props.alwaysUseCopilotForConflictResolution
+    ) {
+      this.setState({
+        alwaysUseCopilotForConflictResolution:
+          this.props.alwaysUseCopilotForConflictResolution,
+      })
+    }
+  }
+
+  private onCancel = () => {
+    if (this.state.initiallySelectedTheme !== this.props.selectedTheme) {
+      this.onSelectedThemeChanged(this.state.initiallySelectedTheme)
+    }
+    if (this.state.initiallySelectedTabSize !== this.props.selectedTabSize) {
+      this.onSelectedTabSizeChanged(this.state.initiallySelectedTabSize)
+    }
+
+    this.props.onDismissed()
   }
 
   public render() {
     return (
       <Dialog
         id="preferences"
-        title={__DARWIN__ ? 'Preferences' : 'Options'}
-        onDismissed={this.props.onDismissed}
+        title={__DARWIN__ ? 'Settings' : 'Options'}
+        onDismissed={this.onCancel}
         onSubmit={this.onSave}
       >
+        {this.renderDisallowedCharactersError()}
         <div className="preferences-container">
-          {this.renderDisallowedCharactersError()}
           <TabBar
             onTabClicked={this.onTabClicked}
-            selectedIndex={this.state.selectedIndex}
+            selectedIndex={this.tabToVisualIndex(this.state.selectedIndex)}
             type={TabBarType.Vertical}
           >
-            <span>
-              <Octicon className="icon" symbol={OcticonSymbol.home} />
+            <span id={this.getTabId(PreferencesTab.Accounts)}>
+              <Octicon className="icon" symbol={octicons.home} />
               Accounts
             </span>
-            <span>
-              <Octicon className="icon" symbol={OcticonSymbol.person} />
+            <span id={this.getTabId(PreferencesTab.Integrations)}>
+              <Octicon className="icon" symbol={octicons.person} />
               Integrations
             </span>
-            <span>
-              <Octicon className="icon" symbol={OcticonSymbol.gitCommit} />
+            {this.isCopilotSdkEnabled && (
+              <span id={this.getTabId(PreferencesTab.Copilot)}>
+                <Octicon className="icon" symbol={octicons.copilot} />
+                Copilot
+              </span>
+            )}
+            <span id={this.getTabId(PreferencesTab.Git)}>
+              <Octicon className="icon" symbol={octicons.gitCommit} />
               Git
             </span>
-            <span>
-              <Octicon className="icon" symbol={OcticonSymbol.paintbrush} />
+            <span id={this.getTabId(PreferencesTab.Appearance)}>
+              <Octicon className="icon" symbol={octicons.paintbrush} />
               Appearance
             </span>
-            <span>
-              <Octicon className="icon" symbol={OcticonSymbol.question} />
+            <span id={this.getTabId(PreferencesTab.Notifications)}>
+              <Octicon className="icon" symbol={octicons.bell} />
+              Notifications
+            </span>
+            <span id={this.getTabId(PreferencesTab.Prompts)}>
+              <Octicon className="icon" symbol={octicons.question} />
               Prompts
             </span>
-            <span>
-              <Octicon className="icon" symbol={OcticonSymbol.settings} />
+            <span id={this.getTabId(PreferencesTab.Advanced)}>
+              <Octicon className="icon" symbol={octicons.gear} />
               Advanced
+            </span>
+            <span id={this.getTabId(PreferencesTab.Accessibility)}>
+              <Octicon className="icon" symbol={octicons.accessibility} />
+              Accessibility
             </span>
           </TabBar>
 
@@ -215,6 +444,43 @@ export class Preferences extends React.Component<
     )
   }
 
+  private getTabId = (tab: PreferencesTab) => {
+    let suffix
+    switch (tab) {
+      case PreferencesTab.Accounts:
+        suffix = 'accounts'
+        break
+      case PreferencesTab.Integrations:
+        suffix = 'integrations'
+        break
+      case PreferencesTab.Copilot:
+        suffix = 'copilot'
+        break
+      case PreferencesTab.Git:
+        suffix = 'git'
+        break
+      case PreferencesTab.Appearance:
+        suffix = 'appearance'
+        break
+      case PreferencesTab.Notifications:
+        suffix = 'notifications'
+        break
+      case PreferencesTab.Prompts:
+        suffix = 'prompts'
+        break
+      case PreferencesTab.Advanced:
+        suffix = 'advanced'
+        break
+      case PreferencesTab.Accessibility:
+        suffix = 'accessibility'
+        break
+      default:
+        return assertNever(tab, `Unknown tab type: ${tab}`)
+    }
+
+    return `preferences-tab-${suffix}`
+  }
+
   private onDotComSignIn = () => {
     this.props.onDismissed()
     this.props.dispatcher.showDotComSignInDialog()
@@ -223,6 +489,22 @@ export class Preferences extends React.Component<
   private onEnterpriseSignIn = () => {
     this.props.onDismissed()
     this.props.dispatcher.showEnterpriseSignInDialog()
+  }
+
+  private onCopilotSignIn = () => {
+    this.setState({ selectedIndex: PreferencesTab.Accounts })
+  }
+
+  private onOpenCopilotPlans = () => {
+    this.props.dispatcher.openInBrowser(
+      'https://github.com/features/copilot/plans'
+    )
+  }
+
+  private onOpenCopilotFeatureSettings = () => {
+    this.props.dispatcher.openInBrowser(
+      'https://github.com/settings/copilot/features'
+    )
   }
 
   private onLogout = (account: Account) => {
@@ -238,6 +520,25 @@ export class Preferences extends React.Component<
     }
   }
 
+  private onSelectedGitTabIndexChanged = (index: number) => {
+    this.setState({ selectedGitTabIndex: index })
+  }
+
+  private onEnableGitHookEnvChanged = (enableGitHookEnv: boolean) => {
+    this.setState({ enableGitHookEnv, hooksPreferencesDirty: true })
+  }
+
+  private onCacheGitHookEnvChanged = (cacheGitHookEnv: boolean) => {
+    this.setState({ cacheGitHookEnv, hooksPreferencesDirty: true })
+  }
+
+  private onSelectedGitHookEnvShellChanged = (selectedShell: string) => {
+    this.setState({
+      selectedGitHookEnvShell: selectedShell,
+      hooksPreferencesDirty: true,
+    })
+  }
+
   private renderActiveTab() {
     const index = this.state.selectedIndex
     let View
@@ -245,8 +546,7 @@ export class Preferences extends React.Component<
       case PreferencesTab.Accounts:
         View = (
           <Accounts
-            dotComAccount={this.props.dotComAccount}
-            enterpriseAccount={this.props.enterpriseAccount}
+            accounts={this.props.accounts}
             onDotComSignIn={this.onDotComSignIn}
             onEnterpriseSignIn={this.onEnterpriseSignIn}
             onLogout={this.onLogout}
@@ -261,11 +561,50 @@ export class Preferences extends React.Component<
             onSelectedEditorChanged={this.onSelectedEditorChanged}
             availableShells={this.state.availableShells}
             selectedShell={this.state.selectedShell}
+            useCustomEditor={this.state.useCustomEditor}
+            customEditor={this.state.customEditor}
+            useCustomShell={this.state.useCustomShell}
+            customShell={this.state.customShell}
+            copilotAppPath={this.state.copilotAppPath}
+            copilotAppPathError={this.state.copilotAppPathError}
             onSelectedShellChanged={this.onSelectedShellChanged}
+            onUseCustomEditorChanged={this.onUseCustomEditorChanged}
+            onCustomEditorChanged={this.onCustomEditorChanged}
+            onUseCustomShellChanged={this.onUseCustomShellChanged}
+            onCustomShellChanged={this.onCustomShellChanged}
+            onCopilotAppPathChanged={this.onCopilotAppPathChanged}
           />
         )
         break
       }
+      case PreferencesTab.Copilot:
+        View = (
+          <CopilotPreferences
+            selectedCopilotModelsByAccount={
+              this.state.selectedCopilotModelsByAccount
+            }
+            copilotModelsByAccount={this.props.copilotModelsByAccount}
+            copilotQuotaSnapshotsByAccount={
+              this.props.copilotQuotaSnapshotsByAccount
+            }
+            accounts={this.props.accounts}
+            byokProviders={this.props.byokProviders}
+            showBYOKSettings={this.shouldShowBYOKSettings()}
+            onSignIn={this.onCopilotSignIn}
+            onOpenCopilotPlans={this.onOpenCopilotPlans}
+            onOpenCopilotFeatureSettings={this.onOpenCopilotFeatureSettings}
+            alwaysUseCopilotForConflictResolution={
+              this.state.alwaysUseCopilotForConflictResolution
+            }
+            onSelectedCopilotModelChanged={this.onSelectedCopilotModelChanged}
+            onAlwaysUseCopilotForConflictResolutionChanged={
+              this.onAlwaysUseCopilotForConflictResolutionChanged
+            }
+            onConfigureCustomProviders={this.onConfigureCustomProviders}
+            onConfigureModels={this.onConfigureCopilotModels}
+          />
+        )
+        break
       case PreferencesTab.Git: {
         const { existingLockFilePath } = this.state
         const error =
@@ -285,12 +624,25 @@ export class Preferences extends React.Component<
             <Git
               name={this.state.committerName}
               email={this.state.committerEmail}
+              accounts={this.props.accounts}
               defaultBranch={this.state.defaultBranch}
-              dotComAccount={this.props.dotComAccount}
-              enterpriseAccount={this.props.enterpriseAccount}
               onNameChanged={this.onCommitterNameChanged}
               onEmailChanged={this.onCommitterEmailChanged}
               onDefaultBranchChanged={this.onDefaultBranchChanged}
+              isLoadingGitConfig={this.state.isLoadingGitConfig}
+              onEditGlobalGitConfig={this.props.onEditGlobalGitConfig}
+              selectedTabIndex={this.state.selectedGitTabIndex}
+              onSelectedTabIndexChanged={this.onSelectedGitTabIndexChanged}
+              onEnableGitHookEnvChanged={this.onEnableGitHookEnvChanged}
+              onCacheGitHookEnvChanged={this.onCacheGitHookEnvChanged}
+              onSelectedShellChanged={this.onSelectedGitHookEnvShellChanged}
+              enableGitHookEnv={
+                this.state.enableGitHookEnv ?? defaultHooksEnvEnabledValue
+              }
+              cacheGitHookEnv={this.state.cacheGitHookEnv ?? true}
+              selectedShell={
+                this.state.selectedGitHookEnvShell ?? defaultGitHookEnvShell
+              }
             />
           </>
         )
@@ -301,6 +653,36 @@ export class Preferences extends React.Component<
           <Appearance
             selectedTheme={this.props.selectedTheme}
             onSelectedThemeChanged={this.onSelectedThemeChanged}
+            selectedTabSize={this.props.selectedTabSize}
+            onSelectedTabSizeChanged={this.onSelectedTabSizeChanged}
+            alwaysShowWorktreeList={this.state.alwaysShowWorktreeList}
+            onAlwaysShowWorktreeListChanged={
+              this.onAlwaysShowWorktreeListChanged
+            }
+            selectedDateFormat={
+              this.state.selectedDateFormat ?? getDateFormatPreference()
+            }
+            onSelectedDateFormatChanged={this.onSelectedDateFormatChanged}
+            selectedTimeFormat={
+              this.state.selectedTimeFormat ?? getTimeFormatPreference()
+            }
+            onSelectedTimeFormatChanged={this.onSelectedTimeFormatChanged}
+            selectedNumberFormat={
+              this.state.selectedNumberFormat ?? getNumberFormatPreference()
+            }
+            onSelectedNumberFormatChanged={this.onSelectedNumberFormatChanged}
+            preferAbsoluteDates={
+              this.state.preferAbsoluteDates ?? getPreferAbsoluteDates()
+            }
+            onPreferAbsoluteDatesChanged={this.onPreferAbsoluteDatesChanged}
+          />
+        )
+        break
+      case PreferencesTab.Notifications:
+        View = (
+          <Notifications
+            notificationsEnabled={this.state.notificationsEnabled}
+            onNotificationsEnabledChanged={this.onNotificationsEnabledChanged}
           />
         )
         break
@@ -309,12 +691,48 @@ export class Preferences extends React.Component<
           <Prompts
             confirmRepositoryRemoval={this.state.confirmRepositoryRemoval}
             confirmDiscardChanges={this.state.confirmDiscardChanges}
+            confirmDiscardChangesPermanently={
+              this.state.confirmDiscardChangesPermanently
+            }
+            confirmDiscardStash={this.state.confirmDiscardStash}
+            confirmCheckoutCommit={this.state.confirmCheckoutCommit}
             confirmForcePush={this.state.confirmForcePush}
+            confirmUndoCommit={this.state.confirmUndoCommit}
+            askForConfirmationOnCommitFilteredChanges={
+              this.state.askForConfirmationOnCommitFilteredChanges
+            }
+            confirmCommitMessageOverride={
+              this.state.confirmCommitMessageOverride
+            }
+            confirmWorktreeRemoval={this.state.confirmWorktreeRemoval}
             onConfirmRepositoryRemovalChanged={
               this.onConfirmRepositoryRemovalChanged
             }
             onConfirmDiscardChangesChanged={this.onConfirmDiscardChangesChanged}
+            onConfirmDiscardStashChanged={this.onConfirmDiscardStashChanged}
+            onConfirmCheckoutCommitChanged={this.onConfirmCheckoutCommitChanged}
             onConfirmForcePushChanged={this.onConfirmForcePushChanged}
+            onConfirmDiscardChangesPermanentlyChanged={
+              this.onConfirmDiscardChangesPermanentlyChanged
+            }
+            onConfirmUndoCommitChanged={this.onConfirmUndoCommitChanged}
+            onAskForConfirmationOnCommitFilteredChanges={
+              this.onAskForConfirmationOnCommitFilteredChanges
+            }
+            onConfirmCommitMessageOverrideChanged={
+              this.onConfirmCommitMessageOverrideChanged
+            }
+            onConfirmWorktreeRemovalChanged={
+              this.onConfirmWorktreeRemovalChanged
+            }
+            uncommittedChangesStrategy={this.state.uncommittedChangesStrategy}
+            onUncommittedChangesStrategyChanged={
+              this.onUncommittedChangesStrategyChanged
+            }
+            showCommitLengthWarning={this.state.showCommitLengthWarning}
+            onShowCommitLengthWarningChanged={
+              this.onShowCommitLengthWarningChanged
+            }
           />
         )
         break
@@ -322,12 +740,14 @@ export class Preferences extends React.Component<
       case PreferencesTab.Advanced: {
         View = (
           <Advanced
+            useWindowsOpenSSH={this.state.useWindowsOpenSSH}
             optOutOfUsageTracking={this.state.optOutOfUsageTracking}
+            useExternalCredentialHelper={this.state.useExternalCredentialHelper}
             repositoryIndicatorsEnabled={this.state.repositoryIndicatorsEnabled}
-            uncommittedChangesStrategy={this.state.uncommittedChangesStrategy}
-            onOptOutofReportingchanged={this.onOptOutofReportingChanged}
-            onUncommittedChangesStrategyChanged={
-              this.onUncommittedChangesStrategyChanged
+            onUseWindowsOpenSSHChanged={this.onUseWindowsOpenSSHChanged}
+            onOptOutofReportingChanged={this.onOptOutofReportingChanged}
+            onUseExternalCredentialHelperChanged={
+              this.onUseExternalCredentialHelperChanged
             }
             onRepositoryIndicatorsEnabledChanged={
               this.onRepositoryIndicatorsEnabledChanged
@@ -336,11 +756,29 @@ export class Preferences extends React.Component<
         )
         break
       }
+      case PreferencesTab.Accessibility:
+        View = (
+          <Accessibility
+            underlineLinks={this.state.underlineLinks}
+            showDiffCheckMarks={this.state.showDiffCheckMarks}
+            onShowDiffCheckMarksChanged={this.onShowDiffCheckMarksChanged}
+            onUnderlineLinksChanged={this.onUnderlineLinksChanged}
+          />
+        )
+        break
       default:
         return assertNever(index, `Unknown tab index: ${index}`)
     }
 
-    return <div className="tab-container">{View}</div>
+    return (
+      <div
+        className="tab-container"
+        role="tabpanel"
+        aria-labelledby={this.getTabId(index)}
+      >
+        {View}
+      </div>
+    )
   }
 
   private onRepositoryIndicatorsEnabledChanged = (
@@ -357,8 +795,26 @@ export class Preferences extends React.Component<
     this.props.dispatcher.postError(e)
   }
 
+  private onUseWindowsOpenSSHChanged = (useWindowsOpenSSH: boolean) => {
+    this.setState({ useWindowsOpenSSH })
+  }
+
+  private onShowCommitLengthWarningChanged = (
+    showCommitLengthWarning: boolean
+  ) => {
+    this.setState({ showCommitLengthWarning })
+  }
+
+  private onNotificationsEnabledChanged = (notificationsEnabled: boolean) => {
+    this.setState({ notificationsEnabled })
+  }
+
   private onOptOutofReportingChanged = (value: boolean) => {
     this.setState({ optOutOfUsageTracking: value })
+  }
+
+  private onUseExternalCredentialHelperChanged = (value: boolean) => {
+    this.setState({ useExternalCredentialHelper: value })
   }
 
   private onConfirmRepositoryRemovalChanged = (value: boolean) => {
@@ -369,8 +825,36 @@ export class Preferences extends React.Component<
     this.setState({ confirmDiscardChanges: value })
   }
 
+  private onConfirmDiscardStashChanged = (value: boolean) => {
+    this.setState({ confirmDiscardStash: value })
+  }
+
+  private onConfirmCheckoutCommitChanged = (value: boolean) => {
+    this.setState({ confirmCheckoutCommit: value })
+  }
+
+  private onConfirmDiscardChangesPermanentlyChanged = (value: boolean) => {
+    this.setState({ confirmDiscardChangesPermanently: value })
+  }
+
   private onConfirmForcePushChanged = (value: boolean) => {
     this.setState({ confirmForcePush: value })
+  }
+
+  private onConfirmUndoCommitChanged = (value: boolean) => {
+    this.setState({ confirmUndoCommit: value })
+  }
+
+  private onAskForConfirmationOnCommitFilteredChanges = (value: boolean) => {
+    this.setState({ askForConfirmationOnCommitFilteredChanges: value })
+  }
+
+  private onConfirmCommitMessageOverrideChanged = (value: boolean) => {
+    this.setState({ confirmCommitMessageOverride: value })
+  }
+
+  private onConfirmWorktreeRemovalChanged = (value: boolean) => {
+    this.setState({ confirmWorktreeRemoval: value })
   }
 
   private onUncommittedChangesStrategyChanged = (
@@ -404,37 +888,152 @@ export class Preferences extends React.Component<
     this.setState({ selectedShell: shell })
   }
 
+  private onSelectedDateFormatChanged = (selectedDateFormat: DateFormat) => {
+    this.setState({ selectedDateFormat })
+  }
+
+  private onSelectedTimeFormatChanged = (selectedTimeFormat: TimeFormat) => {
+    this.setState({ selectedTimeFormat })
+  }
+
+  private onSelectedNumberFormatChanged = (
+    selectedNumberFormat: INumberFormat
+  ) => {
+    this.setState({ selectedNumberFormat })
+  }
+
+  private onPreferAbsoluteDatesChanged = (preferAbsoluteDates: boolean) => {
+    this.setState({ preferAbsoluteDates })
+  }
+
+  private onUseCustomEditorChanged = (useCustomEditor: boolean) => {
+    this.setState({ useCustomEditor })
+  }
+
+  private onCustomEditorChanged = (customEditor: ICustomIntegration) => {
+    this.setState({ customEditor })
+  }
+
+  private onUseCustomShellChanged = (useCustomShell: boolean) => {
+    this.setState({ useCustomShell })
+  }
+
+  private onCustomShellChanged = (customShell: ICustomIntegration) => {
+    this.setState({ customShell })
+  }
+
+  private onCopilotAppPathChanged = (copilotAppPath: string) => {
+    this.setState({ copilotAppPath, copilotAppPathError: undefined })
+  }
+
   private onSelectedThemeChanged = (theme: ApplicationTheme) => {
     this.props.dispatcher.setSelectedTheme(theme)
+  }
+
+  private onUnderlineLinksChanged = (underlineLinks: boolean) => {
+    this.setState({ underlineLinks })
+  }
+
+  private onShowDiffCheckMarksChanged = (showDiffCheckMarks: boolean) => {
+    this.setState({ showDiffCheckMarks })
+  }
+
+  private onSelectedCopilotModelChanged = (
+    account: Account,
+    feature: CopilotFeature,
+    model: string | null
+  ) => {
+    this.setState(state => {
+      const accountKey = getCopilotAccountCacheKey(account)
+      const selections = {
+        ...state.selectedCopilotModelsByAccount.get(accountKey),
+      }
+      if (model === null) {
+        delete selections[feature]
+      } else {
+        selections[feature] = model
+      }
+
+      const selectedCopilotModelsByAccount = new Map(
+        state.selectedCopilotModelsByAccount
+      )
+      if (Object.keys(selections).length === 0) {
+        selectedCopilotModelsByAccount.delete(accountKey)
+      } else {
+        selectedCopilotModelsByAccount.set(accountKey, selections)
+      }
+
+      return { selectedCopilotModelsByAccount }
+    })
+  }
+
+  private onAlwaysUseCopilotForConflictResolutionChanged = (
+    checked: boolean
+  ) => {
+    this.setState({ alwaysUseCopilotForConflictResolution: checked })
+  }
+
+  private shouldShowBYOKSettings(): boolean {
+    return this.props.accounts.some(enableCopilotSdkCommitMessageGeneration)
+  }
+
+  private onConfigureCustomProviders = () => {
+    this.props.dispatcher.showPopup({
+      type: PopupType.CopilotCustomProviders,
+    })
+  }
+
+  private onConfigureCopilotModels = (account: Account) => {
+    this.props.dispatcher.showPopup({
+      type: PopupType.CopilotUserSettings,
+      account,
+    })
+  }
+
+  private onSelectedTabSizeChanged = (tabSize: number) => {
+    this.props.dispatcher.setSelectedTabSize(tabSize)
+  }
+
+  private onAlwaysShowWorktreeListChanged = (
+    alwaysShowWorktreeList: boolean
+  ) => {
+    this.setState({ alwaysShowWorktreeList })
   }
 
   private renderFooter() {
     const hasDisabledError = this.state.disallowedCharactersMessage != null
 
-    const index = this.state.selectedIndex
-    switch (index) {
-      case PreferencesTab.Accounts:
-      case PreferencesTab.Appearance:
-        return null
-      case PreferencesTab.Integrations:
-      case PreferencesTab.Advanced:
-      case PreferencesTab.Prompts:
-      case PreferencesTab.Git: {
-        return (
-          <DialogFooter>
-            <OkCancelButtonGroup
-              okButtonText="Save"
-              okButtonDisabled={hasDisabledError}
-            />
-          </DialogFooter>
-        )
-      }
-      default:
-        return assertNever(index, `Unknown tab index: ${index}`)
-    }
+    return (
+      <DialogFooter>
+        <OkCancelButtonGroup
+          okButtonText="Save"
+          okButtonDisabled={hasDisabledError}
+        />
+      </DialogFooter>
+    )
   }
 
   private onSave = async () => {
+    const { dispatcher } = this.props
+    const copilotAppPath = this.state.copilotAppPath.trim()
+    const initialCopilotAppPath = this.props.copilotAppPath?.trim() ?? ''
+    const copilotAppPathChanged = copilotAppPath !== initialCopilotAppPath
+
+    if (
+      enableCopilotAppHandoff() &&
+      copilotAppPathChanged &&
+      copilotAppPath.length > 0 &&
+      !(await validateCopilotAppPath(copilotAppPath))
+    ) {
+      this.setState({
+        selectedIndex: PreferencesTab.Integrations,
+        copilotAppPathError: __DARWIN__
+          ? 'Choose the GitHub Copilot application (.app).'
+          : 'Choose the GitHub Copilot executable (github.exe).',
+      })
+      return
+    }
+
     try {
       let shouldRefreshAuthor = false
 
@@ -449,7 +1048,7 @@ export class Preferences extends React.Component<
       }
 
       if (this.props.repository !== null && shouldRefreshAuthor) {
-        this.props.dispatcher.refreshAuthor(this.props.repository)
+        dispatcher.refreshAuthor(this.props.repository)
       }
 
       // If the entered default branch is empty, we don't store it and keep
@@ -470,9 +1069,23 @@ export class Preferences extends React.Component<
         this.props.repositoryIndicatorsEnabled !==
         this.state.repositoryIndicatorsEnabled
       ) {
-        this.props.dispatcher.setRepositoryIndicatorsEnabled(
+        dispatcher.setRepositoryIndicatorsEnabled(
           this.state.repositoryIndicatorsEnabled
         )
+      }
+
+      if (this.state.hooksPreferencesDirty) {
+        if (this.state.enableGitHookEnv !== undefined) {
+          setHooksEnvEnabled(this.state.enableGitHookEnv)
+        }
+
+        if (this.state.cacheGitHookEnv !== undefined) {
+          setCacheHooksEnv(this.state.cacheGitHookEnv)
+        }
+
+        if (this.state.selectedGitHookEnvShell !== undefined) {
+          setGitHookEnvShell(this.state.selectedGitHookEnvShell)
+        }
       }
     } catch (e) {
       if (isConfigFileLockError(e)) {
@@ -488,40 +1101,141 @@ export class Preferences extends React.Component<
       }
 
       this.props.onDismissed()
-      this.props.dispatcher.postError(e)
+      dispatcher.postError(e)
       return
     }
 
-    await this.props.dispatcher.setStatsOptOut(
-      this.state.optOutOfUsageTracking,
-      false
-    )
-    await this.props.dispatcher.setConfirmRepoRemovalSetting(
+    dispatcher.setUseWindowsOpenSSH(this.state.useWindowsOpenSSH)
+    dispatcher.setShowCommitLengthWarning(this.state.showCommitLengthWarning)
+    dispatcher.setNotificationsEnabled(this.state.notificationsEnabled)
+
+    await dispatcher.setStatsOptOut(this.state.optOutOfUsageTracking, false)
+
+    const { useCustomEditor, customEditor, useCustomShell, customShell } =
+      this.state
+
+    const isValidCustomEditor =
+      customEditor && (await isValidCustomIntegration(customEditor))
+    dispatcher.setUseCustomEditor(useCustomEditor && isValidCustomEditor)
+    if (isValidCustomEditor) {
+      dispatcher.setCustomEditor(customEditor)
+    }
+
+    const isValidCustomShell =
+      customShell && (await isValidCustomIntegration(customShell))
+    dispatcher.setUseCustomShell(useCustomShell && isValidCustomShell)
+    if (isValidCustomShell) {
+      dispatcher.setCustomShell(customShell)
+    }
+
+    if (enableCopilotAppHandoff() && copilotAppPathChanged) {
+      await dispatcher.setCopilotAppPath(
+        copilotAppPath.length === 0 ? null : copilotAppPath
+      )
+    }
+
+    if (
+      this.props.useExternalCredentialHelper !==
+      this.state.useExternalCredentialHelper
+    ) {
+      dispatcher.setUseExternalCredentialHelper(
+        this.state.useExternalCredentialHelper
+      )
+    }
+
+    await dispatcher.setConfirmRepoRemovalSetting(
       this.state.confirmRepositoryRemoval
     )
 
-    await this.props.dispatcher.setConfirmForcePushSetting(
-      this.state.confirmForcePush
+    await dispatcher.setConfirmForcePushSetting(this.state.confirmForcePush)
+
+    await dispatcher.setConfirmDiscardStashSetting(
+      this.state.confirmDiscardStash
+    )
+
+    await dispatcher.setConfirmCheckoutCommitSetting(
+      this.state.confirmCheckoutCommit
+    )
+
+    await dispatcher.setConfirmUndoCommitSetting(this.state.confirmUndoCommit)
+    await dispatcher.setConfirmCommitFilteredChanges(
+      this.state.askForConfirmationOnCommitFilteredChanges
+    )
+    await dispatcher.setConfirmCommitMessageOverrideSetting(
+      this.state.confirmCommitMessageOverride
+    )
+    await dispatcher.setConfirmWorktreeRemovalSetting(
+      this.state.confirmWorktreeRemoval
     )
 
     if (this.state.selectedExternalEditor) {
-      await this.props.dispatcher.setExternalEditor(
-        this.state.selectedExternalEditor
-      )
+      await dispatcher.setExternalEditor(this.state.selectedExternalEditor)
     }
-    await this.props.dispatcher.setShell(this.state.selectedShell)
-    await this.props.dispatcher.setConfirmDiscardChangesSetting(
+    await dispatcher.setShell(this.state.selectedShell)
+    await dispatcher.setConfirmDiscardChangesSetting(
       this.state.confirmDiscardChanges
     )
+    await dispatcher.setConfirmDiscardChangesPermanentlySetting(
+      this.state.confirmDiscardChangesPermanently
+    )
 
-    await this.props.dispatcher.setUncommittedChangesStrategySetting(
+    await dispatcher.setUncommittedChangesStrategySetting(
       this.state.uncommittedChangesStrategy
     )
+
+    dispatcher.setUnderlineLinksSetting(this.state.underlineLinks)
+
+    dispatcher.setDiffCheckMarksSetting(this.state.showDiffCheckMarks)
+    dispatcher.setAlwaysShowWorktreeList(this.state.alwaysShowWorktreeList)
+
+    dispatcher.setSelectedCopilotModelsByAccount(
+      this.state.selectedCopilotModelsByAccount
+    )
+
+    dispatcher.setAlwaysUseCopilotForConflictResolution(
+      this.state.alwaysUseCopilotForConflictResolution
+    )
+
+    if (enableFormattingPreferences()) {
+      if (this.state.selectedDateFormat !== undefined) {
+        setDateFormatPreference(this.state.selectedDateFormat)
+      }
+
+      if (this.state.selectedTimeFormat !== undefined) {
+        setTimeFormatPreference(this.state.selectedTimeFormat)
+      }
+
+      if (this.state.selectedNumberFormat !== undefined) {
+        setNumberFormatPreference(this.state.selectedNumberFormat)
+      }
+
+      if (this.state.preferAbsoluteDates !== undefined) {
+        dispatcher.setPreferAbsoluteDates(this.state.preferAbsoluteDates)
+      }
+    }
 
     this.props.onDismissed()
   }
 
-  private onTabClicked = (index: number) => {
-    this.setState({ selectedIndex: index })
+  private onTabClicked = (visualIndex: number) => {
+    this.setState({ selectedIndex: this.visualIndexToTab(visualIndex) })
+  }
+
+  private get isCopilotSdkEnabled(): boolean {
+    return this.props.accounts.some(enableCopilotSdkCommitMessageGeneration)
+  }
+
+  private tabToVisualIndex(tab: PreferencesTab): number {
+    if (!this.isCopilotSdkEnabled && tab > PreferencesTab.Copilot) {
+      return tab - 1
+    }
+    return tab
+  }
+
+  private visualIndexToTab(index: number): PreferencesTab {
+    if (!this.isCopilotSdkEnabled && index >= PreferencesTab.Copilot) {
+      return index + 1
+    }
+    return index
   }
 }

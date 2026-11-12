@@ -11,24 +11,22 @@ import {
   getForkContributionTarget,
   isRepositoryWithForkedGitHubRepository,
 } from '../../models/repository'
-import { Dialog, DialogError, DialogFooter } from '../dialog'
+import { Dialog, DialogContent, DialogError, DialogFooter } from '../dialog'
 import { NoRemote } from './no-remote'
 import { readGitIgnoreAtRoot } from '../../lib/git'
 import { OkCancelButtonGroup } from '../dialog/ok-cancel-button-group'
 import { ForkSettings } from './fork-settings'
 import { ForkContributionTarget } from '../../models/workflow-preferences'
 import { GitConfigLocation, GitConfig } from './git-config'
-import {
-  getConfigValue,
-  getGlobalConfigValue,
-  removeConfigValue,
-  setConfigValue,
-} from '../../lib/git/config'
+import { getConfigValue, getGlobalConfigValue } from '../../lib/git/config'
 import {
   gitAuthorNameIsValid,
   InvalidGitAuthorNameMessage,
 } from '../lib/identifier-rules'
-import { Account } from '../../models/account'
+import { Account, isSameAccount } from '../../models/account'
+import { Octicon } from '../octicons'
+import * as octicons from '../octicons/octicons.generated'
+import { Select } from '../lib/select'
 
 interface IRepositorySettingsProps {
   readonly initialSelectedTab?: RepositorySettingsTab
@@ -36,6 +34,7 @@ interface IRepositorySettingsProps {
   readonly remote: IRemote | null
   readonly repository: Repository
   readonly repositoryAccount: Account | null
+  readonly accounts: ReadonlyArray<Account>
   readonly onDismissed: () => void
 }
 
@@ -63,6 +62,8 @@ interface IRepositorySettingsState {
   readonly initialCommitterEmail: string | null
   readonly errors?: ReadonlyArray<JSX.Element | string>
   readonly forkContributionTarget: ForkContributionTarget
+  readonly isLoadingGitConfig: boolean
+  readonly selectedLogin?: string | null
 }
 
 export class RepositorySettings extends React.Component<
@@ -89,6 +90,7 @@ export class RepositorySettings extends React.Component<
       initialGitConfigLocation: GitConfigLocation.Global,
       initialCommitterName: null,
       initialCommitterEmail: null,
+      isLoadingGitConfig: true,
     }
   }
 
@@ -141,6 +143,7 @@ export class RepositorySettings extends React.Component<
       initialGitConfigLocation: gitConfigLocation,
       initialCommitterName: localCommitterName,
       initialCommitterEmail: localCommitterEmail,
+      isLoadingGitConfig: false,
     })
   }
 
@@ -178,35 +181,35 @@ export class RepositorySettings extends React.Component<
             selectedIndex={this.state.selectedTab}
             type={TabBarType.Vertical}
           >
-            <span>Remote</span>
-            <span>{__DARWIN__ ? 'Ignored Files' : 'Ignored files'}</span>
-            <span>{__DARWIN__ ? 'Git Config' : 'Git config'}</span>
+            <span>
+              <Octicon className="icon" symbol={octicons.server} />
+              Remote
+            </span>
+            <span>
+              <Octicon className="icon" symbol={octicons.file} />
+              {__DARWIN__ ? 'Ignored Files' : 'Ignored files'}
+            </span>
+            <span>
+              <Octicon className="icon" symbol={octicons.gitCommit} />
+              {__DARWIN__ ? 'Git Config' : 'Git config'}
+            </span>
             {showForkSettings && (
-              <span>{__DARWIN__ ? 'Fork Behavior' : 'Fork behavior'}</span>
+              <span>
+                <Octicon className="icon" symbol={octicons.repoForked} />
+                {__DARWIN__ ? 'Fork Behavior' : 'Fork behavior'}
+              </span>
             )}
           </TabBar>
 
           <div className="active-tab">{this.renderActiveTab()}</div>
         </div>
-        {this.renderFooter()}
+        <DialogFooter>
+          <OkCancelButtonGroup
+            okButtonText="Save"
+            okButtonDisabled={this.state.saveDisabled}
+          />
+        </DialogFooter>
       </Dialog>
-    )
-  }
-
-  private renderFooter() {
-    const tab = this.state.selectedTab
-    const remote = this.state.remote
-    if (tab === RepositorySettingsTab.Remote && !remote) {
-      return null
-    }
-
-    return (
-      <DialogFooter>
-        <OkCancelButtonGroup
-          okButtonText="Save"
-          okButtonDisabled={this.state.saveDisabled}
-        />
-      </DialogFooter>
     )
   }
 
@@ -215,16 +218,19 @@ export class RepositorySettings extends React.Component<
     switch (tab) {
       case RepositorySettingsTab.Remote: {
         const remote = this.state.remote
-        if (remote) {
-          return (
-            <Remote
-              remote={remote}
-              onRemoteUrlChanged={this.onRemoteUrlChanged}
-            />
-          )
-        } else {
-          return <NoRemote onPublish={this.onPublish} />
-        }
+        return (
+          <DialogContent>
+            {remote ? (
+              <Remote
+                remote={remote}
+                onRemoteUrlChanged={this.onRemoteUrlChanged}
+              />
+            ) : (
+              <NoRemote onPublish={this.onPublish} />
+            )}
+            {this.renderAccount()}
+          </DialogContent>
+        )
       }
       case RepositorySettingsTab.IgnoredFiles: {
         return (
@@ -254,7 +260,7 @@ export class RepositorySettings extends React.Component<
       case RepositorySettingsTab.GitConfig: {
         return (
           <GitConfig
-            account={this.props.repositoryAccount}
+            account={this.selectedAccount}
             gitConfigLocation={this.state.gitConfigLocation}
             onGitConfigLocationChanged={this.onGitConfigLocationChanged}
             name={this.state.committerName}
@@ -263,6 +269,7 @@ export class RepositorySettings extends React.Component<
             globalEmail={this.state.globalCommitterEmail}
             onNameChanged={this.onCommitterNameChanged}
             onEmailChanged={this.onCommitterEmailChanged}
+            isLoadingGitConfig={this.state.isLoadingGitConfig}
           />
         )
       }
@@ -270,6 +277,63 @@ export class RepositorySettings extends React.Component<
       default:
         return assertNever(tab, `Unknown tab type: ${tab}`)
     }
+  }
+
+  private get selectedLogin() {
+    return this.state.selectedLogin === undefined
+      ? this.props.repository.login
+      : this.state.selectedLogin
+  }
+
+  private get selectedAccount() {
+    const endpoint = this.props.repository.gitHubRepository?.endpoint
+    const login = this.selectedLogin
+    return endpoint === undefined
+      ? this.props.repositoryAccount
+      : this.props.accounts.find(
+          a => login !== null && isSameAccount(a, { endpoint, login })
+        ) ?? null
+  }
+
+  private renderAccount() {
+    const endpoint = this.props.repository.gitHubRepository?.endpoint
+    if (endpoint === undefined) {
+      return null
+    }
+
+    const accounts = this.props.accounts.filter(a => a.endpoint === endpoint)
+    const login = this.selectedLogin
+    const signedOut = login !== null && this.selectedAccount === null
+
+    return (
+      <div className="repository-account">
+        <Select
+          label="Account"
+          value={this.selectedAccount?.login ?? login ?? ''}
+          onChange={this.onAccountChanged}
+        >
+          <option value="">None (unassigned)</option>
+          {signedOut && (
+            <option value={login ?? ''} disabled={true}>
+              @{login} (signed out)
+            </option>
+          )}
+          {accounts.map(account => (
+            <option key={account.login} value={account.login}>
+              @{account.login}
+            </option>
+          ))}
+        </Select>
+        <p className="repository-account-description">
+          The account used for GitHub API requests and HTTPS authentication.
+          This does not change your Git author name or email.
+        </p>
+      </div>
+    )
+  }
+
+  private onAccountChanged = (event: React.FormEvent<HTMLSelectElement>) => {
+    this.setState({ selectedLogin: event.currentTarget.value || null })
   }
 
   private onPublish = () => {
@@ -286,14 +350,34 @@ export class RepositorySettings extends React.Component<
   private onSubmit = async () => {
     this.setState({ disabled: true, errors: undefined })
     const errors = new Array<JSX.Element | string>()
+    // Changing the account replaces the repository, and setting the remote
+    // URL must refresh the GitHub association for the replacement.
+    let repository = this.props.repository
+
+    if (
+      repository.gitHubRepository !== null &&
+      this.state.selectedLogin !== undefined &&
+      this.state.selectedLogin !== repository.login
+    ) {
+      try {
+        repository = await this.props.dispatcher.updateRepositoryAccount(
+          repository,
+          this.state.selectedLogin
+        )
+      } catch (e) {
+        errors.push(`Failed saving the repository account: ${e}`)
+      }
+    }
 
     if (this.state.remote && this.props.remote) {
-      if (this.state.remote.url !== this.props.remote.url) {
+      const trimmedUrl = this.state.remote.url.trim()
+
+      if (trimmedUrl !== this.props.remote.url) {
         try {
           await this.props.dispatcher.setRemoteURL(
-            this.props.repository,
+            repository,
             this.props.remote.name,
-            this.state.remote.url
+            trimmedUrl
           )
         } catch (e) {
           log.error(
@@ -338,35 +422,44 @@ export class RepositorySettings extends React.Component<
     const gitLocationChanged =
       this.state.gitConfigLocation !== this.state.initialGitConfigLocation
 
-    if (
-      gitLocationChanged &&
-      this.state.gitConfigLocation === GitConfigLocation.Global
-    ) {
-      // If it's now configured to use the global config, just delete the local
-      // user info in this repository.
-      await removeConfigValue(this.props.repository, 'user.name')
-      await removeConfigValue(this.props.repository, 'user.email')
-
-      shouldRefreshAuthor = true
-    } else if (this.state.gitConfigLocation === GitConfigLocation.Local) {
-      // Otherwise, update the local name and email if needed
-      if (this.state.committerName !== this.state.initialCommitterName) {
-        await setConfigValue(
-          this.props.repository,
-          'user.name',
-          this.state.committerName
-        )
+    try {
+      if (
+        gitLocationChanged &&
+        this.state.gitConfigLocation === GitConfigLocation.Global
+      ) {
+        // If it's now configured to use the global config, just delete the local
+        // user info in this repository.
         shouldRefreshAuthor = true
-      }
-
-      if (this.state.committerEmail !== this.state.initialCommitterEmail) {
-        await setConfigValue(
+        await this.props.dispatcher.updateRepositoryCommitter(
           this.props.repository,
-          'user.email',
-          this.state.committerEmail
+          null,
+          null
         )
-        shouldRefreshAuthor = true
+      } else if (this.state.gitConfigLocation === GitConfigLocation.Local) {
+        // Otherwise, update the local name and email if needed
+        const name =
+          this.state.committerName !== this.state.initialCommitterName
+            ? this.state.committerName
+            : undefined
+        const email =
+          this.state.committerEmail !== this.state.initialCommitterEmail
+            ? this.state.committerEmail
+            : undefined
+        if (name !== undefined || email !== undefined) {
+          shouldRefreshAuthor = true
+          await this.props.dispatcher.updateRepositoryCommitter(
+            this.props.repository,
+            name,
+            email
+          )
+        }
       }
+    } catch (error) {
+      log.error(
+        `RepositorySettings: unable to update Git identity at ${this.props.repository.path}`,
+        error
+      )
+      errors.push(`Failed updating Git identity: ${error}`)
     }
 
     if (shouldRefreshAuthor) {

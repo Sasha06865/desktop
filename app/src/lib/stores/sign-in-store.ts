@@ -1,7 +1,6 @@
 import { Disposable } from 'event-kit'
 import { Account } from '../../models/account'
-import { assertNever, fatalError } from '../fatal-error'
-import { askUserToOAuth } from '../../lib/oauth'
+import { fatalError } from '../fatal-error'
 import {
   validateURL,
   InvalidURLErrorName,
@@ -9,27 +8,21 @@ import {
 } from '../../ui/lib/enterprise-validate-url'
 
 import {
-  createAuthorization,
-  AuthorizationResponse,
   fetchUser,
-  AuthorizationResponseKind,
-  getHTMLURL,
   getDotComAPIEndpoint,
   getEnterpriseAPIURL,
-  fetchMetadata,
+  getOAuthAuthorizationURL,
+  getHTMLURL,
 } from '../../lib/api'
 
-import { AuthenticationMode } from '../../lib/2fa'
-
-import { minimumSupportedEnterpriseVersion } from '../../lib/enterprise'
 import { TypedBaseStore } from './base-store'
-import { timeout } from '../promise'
-
-function getUnverifiedUserErrorMessage(login: string): string {
-  return `Unable to authenticate. The account ${login} is lacking a verified email address. Please sign in to GitHub.com, confirm your email address in the Emails section under Personal settings, and try again.`
-}
-
-const EnterpriseTooOldMessage = `The GitHub Enterprise version does not support GitHub Desktop. Talk to your server's administrator about upgrading to the latest version of GitHub Enterprise.`
+import { IOAuthAction } from '../parse-app-url'
+import { shell } from '../app-shell'
+import noop from 'lodash/noop'
+import { AccountsStore } from './accounts-store'
+import { isGHES } from '../endpoint-capabilities'
+import { exchangeOAuthToken } from '../oauth-token'
+import { shouldRequestShortLivedTokens } from '../short-lived-token-rollout'
 
 /**
  * An enumeration of the possible steps that the sign in
@@ -49,7 +42,6 @@ export enum SignInStep {
 export type SignInState =
   | IEndpointEntryState
   | IAuthenticationState
-  | ITwoFactorAuthenticationState
   | ISuccessState
 
 /**
@@ -76,6 +68,8 @@ export interface ISignInState {
    * sign in process is ongoing.
    */
   readonly loading: boolean
+
+  readonly resultCallback: (result: SignInResult) => void
 }
 
 /**
@@ -85,6 +79,7 @@ export interface ISignInState {
  */
 export interface IEndpointEntryState extends ISignInState {
   readonly kind: SignInStep.EndpointEntry
+  readonly resultCallback: (result: SignInResult) => void
 }
 
 /**
@@ -106,55 +101,20 @@ export interface IAuthenticationState extends ISignInState {
    */
   readonly endpoint: string
 
-  /**
-   * A value indicating whether or not the endpoint supports
-   * basic authentication (i.e. username and password). All
-   * GitHub Enterprise instances support OAuth (or web
-   * flow sign-in).
-   */
-  readonly supportsBasicAuth: boolean
+  /** The account login required when reauthenticating a specific account. */
+  readonly expectedLogin?: string
 
-  /**
-   * The endpoint-specific URL for resetting credentials.
-   */
-  readonly forgotPasswordUrl: string
-}
+  /** Whether Git supplied this unfamiliar Enterprise Server endpoint. */
+  readonly isUnrecognizedEnterpriseServer?: boolean
 
-/**
- * State interface representing the TwoFactorAuthentication
- * step where the user provides an OTP token. This step
- * occurs after the authentication step both for GitHub.com,
- * and GitHub Enterprise when the user has enabled two
- * factor authentication on the host.
- */
-export interface ITwoFactorAuthenticationState extends ISignInState {
-  readonly kind: SignInStep.TwoFactorAuthentication
+  readonly resultCallback: (result: SignInResult) => void
 
-  /**
-   * The URL to the host which we're currently authenticating
-   * against. This will be either https://api.github.com when
-   * signing in against GitHub.com or a user-specified
-   * URL when signing in against a GitHub Enterprise
-   * instance.
-   */
-  readonly endpoint: string
-
-  /**
-   * The username specified by the user in the preceding
-   * Authentication step
-   */
-  readonly username: string
-
-  /**
-   * The password specified by the user in the preceding
-   * Authentication step
-   */
-  readonly password: string
-
-  /**
-   * The 2FA type expected by the GitHub endpoint.
-   */
-  readonly type: AuthenticationMode
+  readonly oauthState?: {
+    state: string
+    endpoint: string
+    onAuthCompleted: (account: Account) => void
+    onAuthError: (error: Error) => void
+  }
 }
 
 /**
@@ -165,31 +125,16 @@ export interface ITwoFactorAuthenticationState extends ISignInState {
  */
 export interface ISuccessState {
   readonly kind: SignInStep.Success
-}
-
-/**
- * The method used to authenticate a user.
- */
-export enum SignInMethod {
-  /**
-   * In-app sign-in with username, password, and possibly a
-   * two-factor code.
-   */
-  Basic = 'basic',
-  /**
-   * Sign-in through a web browser with a redirect back to
-   * the application.
-   */
-  Web = 'web',
+  readonly resultCallback: (result: SignInResult) => void
 }
 
 interface IAuthenticationEvent {
   readonly account: Account
-  readonly method: SignInMethod
 }
 
-/** The maximum time to wait for a `/meta` API call in milliseconds */
-const ServerMetaDataTimeout = 2000
+export type SignInResult =
+  | { kind: 'success'; account: Account }
+  | { kind: 'cancelled' }
 
 /**
  * A store encapsulating all logic related to signing in a user
@@ -197,15 +142,23 @@ const ServerMetaDataTimeout = 2000
  */
 export class SignInStore extends TypedBaseStore<SignInState | null> {
   private state: SignInState | null = null
-  /**
-   * A map keyed on an endpoint url containing the last known
-   * value of the verifiable_password_authentication meta property
-   * for that endpoint.
-   */
-  private endpointSupportBasicAuth = new Map<string, boolean>()
+  private resolvingOAuthState: string | undefined
 
-  private emitAuthenticate(account: Account, method: SignInMethod) {
-    const event: IAuthenticationEvent = { account, method }
+  private accounts: ReadonlyArray<Account> = []
+
+  public constructor(private readonly accountStore: AccountsStore) {
+    super()
+
+    this.accountStore.getAll().then(accounts => {
+      this.accounts = accounts
+    })
+    this.accountStore.onDidUpdate(accounts => {
+      this.accounts = accounts
+    })
+  }
+
+  private emitAuthenticate(account: Account) {
+    const event: IAuthenticationEvent = { account }
     this.emitter.emit('did-authenticate', event)
   }
 
@@ -213,13 +166,11 @@ export class SignInStore extends TypedBaseStore<SignInState | null> {
    * Registers an event handler which will be invoked whenever
    * a user has successfully completed a sign-in process.
    */
-  public onDidAuthenticate(
-    fn: (account: Account, method: SignInMethod) => void
-  ): Disposable {
+  public onDidAuthenticate(fn: (account: Account) => void): Disposable {
     return this.emitter.on(
       'did-authenticate',
-      ({ account, method }: IAuthenticationEvent) => {
-        fn(account, method)
+      ({ account }: IAuthenticationEvent) => {
+        fn(account)
       }
     )
   }
@@ -241,250 +192,237 @@ export class SignInStore extends TypedBaseStore<SignInState | null> {
     this.emitUpdate(this.getState())
   }
 
-  private async endpointSupportsBasicAuth(endpoint: string): Promise<boolean> {
-    if (endpoint === getDotComAPIEndpoint()) {
-      return false
-    }
-
-    const cached = this.endpointSupportBasicAuth.get(endpoint)
-    const fallbackValue =
-      cached === undefined
-        ? null
-        : { verifiable_password_authentication: cached }
-
-    const response = await timeout(
-      fetchMetadata(endpoint),
-      ServerMetaDataTimeout,
-      fallbackValue
-    )
-
-    if (response !== null) {
-      const supportsBasicAuth =
-        response.verifiable_password_authentication === true
-      this.endpointSupportBasicAuth.set(endpoint, supportsBasicAuth)
-
-      return supportsBasicAuth
-    }
-
-    throw new Error(
-      `Unable to authenticate with the GitHub Enterprise instance. Verify that the URL is correct, that your GitHub Enterprise instance is running version ${minimumSupportedEnterpriseVersion} or later, that you have an internet connection and try again.`
-    )
-  }
-
-  private getForgotPasswordURL(endpoint: string): string {
-    return `${getHTMLURL(endpoint)}/password_reset`
-  }
-
   /**
    * Clear any in-flight sign in state and return to the
    * initial (no sign-in) state.
    */
   public reset() {
+    const currentState = this.state
     this.setState(null)
+
+    if (currentState?.kind === SignInStep.Authentication) {
+      currentState.oauthState?.onAuthError(new Error('cancelled'))
+    }
+    if (currentState !== null && currentState.kind !== SignInStep.Success) {
+      currentState.resultCallback({ kind: 'cancelled' })
+    }
   }
 
   /**
    * Initiate a sign in flow for github.com. This will put the store
    * in the Authentication step ready to receive user credentials.
    */
-  public beginDotComSignIn() {
+  public beginDotComSignIn(resultCallback?: (result: SignInResult) => void) {
     const endpoint = getDotComAPIEndpoint()
+
+    if (this.state !== null) {
+      this.reset()
+    }
 
     this.setState({
       kind: SignInStep.Authentication,
       endpoint,
-      supportsBasicAuth: false,
       error: null,
       loading: false,
-      forgotPasswordUrl: this.getForgotPasswordURL(endpoint),
+      resultCallback: resultCallback ?? noop,
     })
-
-    // Asynchronously refresh our knowledge about whether GitHub.com
-    // support username and password authentication or not.
-    this.endpointSupportsBasicAuth(endpoint)
-      .then(supportsBasicAuth => {
-        if (
-          this.state !== null &&
-          this.state.kind === SignInStep.Authentication &&
-          this.state.endpoint === endpoint
-        ) {
-          this.setState({ ...this.state, supportsBasicAuth })
-        }
-      })
-      .catch(err =>
-        log.error(
-          'Failed resolving whether GitHub.com supports password authentication',
-          err
-        )
-      )
   }
 
-  /**
-   * Attempt to advance from the authentication step using a username
-   * and password. This method must only be called when the store is
-   * in the authentication step or an error will be thrown. If the
-   * provided credentials are valid the store will either advance to
-   * the Success step or to the TwoFactorAuthentication step if the
-   * user has enabled two factor authentication.
-   *
-   * If an error occurs during sign in (such as invalid credentials)
-   * the authentication state will be updated with that error so that
-   * the responsible component can present it to the user.
-   */
-  public async authenticateWithBasicAuth(
-    username: string,
-    password: string
-  ): Promise<void> {
-    const currentState = this.state
-
-    if (!currentState || currentState.kind !== SignInStep.Authentication) {
-      const stepText = currentState ? currentState.kind : 'null'
-      return fatalError(
-        `Sign in step '${stepText}' not compatible with authentication`
-      )
+  /** Begin reauthentication for a specific login at a known API endpoint. */
+  public beginSignInForAccount(
+    endpoint: string,
+    login: string,
+    resultCallback?: (result: SignInResult) => void
+  ) {
+    if (this.state !== null) {
+      this.reset()
     }
 
-    const endpoint = currentState.endpoint
-
-    this.setState({ ...currentState, loading: true })
-
-    let response: AuthorizationResponse
-    try {
-      response = await createAuthorization(endpoint, username, password, null)
-    } catch (e) {
-      this.emitError(e)
-      return
-    }
-
-    if (!this.state || this.state.kind !== SignInStep.Authentication) {
-      // Looks like the sign in flow has been aborted
-      return
-    }
-
-    if (response.kind === AuthorizationResponseKind.Authorized) {
-      const token = response.token
-      const user = await fetchUser(endpoint, token)
-
-      if (!this.state || this.state.kind !== SignInStep.Authentication) {
-        // Looks like the sign in flow has been aborted
-        return
-      }
-
-      this.emitAuthenticate(user, SignInMethod.Basic)
-      this.setState({ kind: SignInStep.Success })
-    } else if (
-      response.kind ===
-      AuthorizationResponseKind.TwoFactorAuthenticationRequired
-    ) {
-      this.setState({
-        kind: SignInStep.TwoFactorAuthentication,
-        endpoint,
-        username,
-        password,
-        type: response.type,
-        error: null,
-        loading: false,
-      })
-    } else {
-      if (response.kind === AuthorizationResponseKind.Error) {
-        this.emitError(
-          new Error(
-            `The server responded with an error while attempting to authenticate (${response.response.status})\n\n${response.response.statusText}`
-          )
-        )
-        this.setState({ ...currentState, loading: false })
-      } else if (response.kind === AuthorizationResponseKind.Failed) {
-        if (username.includes('@')) {
-          this.setState({
-            ...currentState,
-            loading: false,
-            error: new Error('Incorrect email or password.'),
-          })
-        } else {
-          this.setState({
-            ...currentState,
-            loading: false,
-            error: new Error('Incorrect username or password.'),
-          })
-        }
-      } else if (
-        response.kind === AuthorizationResponseKind.UserRequiresVerification
-      ) {
-        this.setState({
-          ...currentState,
-          loading: false,
-          error: new Error(getUnverifiedUserErrorMessage(username)),
-        })
-      } else if (
-        response.kind === AuthorizationResponseKind.PersonalAccessTokenBlocked
-      ) {
-        this.setState({
-          ...currentState,
-          loading: false,
-          error: new Error(
-            'A personal access token cannot be used to login to GitHub Desktop.'
-          ),
-        })
-      } else if (response.kind === AuthorizationResponseKind.EnterpriseTooOld) {
-        this.setState({
-          ...currentState,
-          loading: false,
-          error: new Error(EnterpriseTooOldMessage),
-        })
-      } else if (response.kind === AuthorizationResponseKind.WebFlowRequired) {
-        this.setState({
-          ...currentState,
-          loading: false,
-          supportsBasicAuth: false,
-          kind: SignInStep.Authentication,
-        })
-      } else {
-        return assertNever(response, `Unsupported response: ${response}`)
-      }
-    }
+    this.setState({
+      kind: SignInStep.Authentication,
+      endpoint,
+      expectedLogin: login,
+      error: null,
+      loading: false,
+      resultCallback: resultCallback ?? noop,
+    })
   }
 
   /**
    * Initiate an OAuth sign in using the system configured browser.
    * This method must only be called when the store is in the authentication
    * step or an error will be thrown.
-   *
-   * The promise returned will only resolve once the user has successfully
-   * authenticated. If the user terminates the sign-in process by closing
-   * their browser before the protocol handler is invoked, by denying the
-   * protocol handler to execute or by providing the wrong credentials
-   * this promise will never complete.
    */
-  public async authenticateWithBrowser(): Promise<void> {
+  public async authenticateWithBrowser() {
     const currentState = this.state
 
-    if (!currentState || currentState.kind !== SignInStep.Authentication) {
+    if (currentState?.kind !== SignInStep.Authentication) {
       const stepText = currentState ? currentState.kind : 'null'
       return fatalError(
         `Sign in step '${stepText}' not compatible with browser authentication`
       )
     }
 
-    this.setState({ ...currentState, loading: true })
+    const authenticatingState = { ...currentState, loading: true }
+    this.setState(authenticatingState)
 
-    let account: Account
-    try {
+    const shortLived = await shouldRequestShortLivedTokens(
+      currentState.endpoint
+    )
+    if (this.state !== authenticatingState) {
+      return
+    }
+
+    const csrfToken = crypto.randomUUID()
+
+    new Promise<Account>((resolve, reject) => {
+      const { endpoint, resultCallback } = currentState
       log.info('[SignInStore] initializing OAuth flow')
-      account = await askUserToOAuth(currentState.endpoint)
-      log.info('[SignInStore] account resolved')
-    } catch (e) {
-      log.info('[SignInStore] error with OAuth flow', e)
-      this.setState({ ...currentState, error: e, loading: false })
-      return
-    }
+      this.setState({
+        kind: SignInStep.Authentication,
+        endpoint,
+        expectedLogin:
+          currentState.kind === SignInStep.Authentication
+            ? currentState.expectedLogin
+            : undefined,
+        isUnrecognizedEnterpriseServer:
+          currentState.kind === SignInStep.Authentication
+            ? currentState.isUnrecognizedEnterpriseServer
+            : undefined,
+        resultCallback,
+        error: null,
+        loading: true,
+        oauthState: {
+          state: csrfToken,
+          endpoint,
+          onAuthCompleted: resolve,
+          onAuthError: reject,
+        },
+      })
+      shell.openExternal(
+        getOAuthAuthorizationURL(
+          endpoint,
+          csrfToken,
+          currentState.expectedLogin,
+          shortLived
+        )
+      )
+    })
+      .then(account => {
+        if (
+          this.state?.kind !== SignInStep.Authentication ||
+          this.state.oauthState?.state !== csrfToken
+        ) {
+          // Looks like the sign in flow has been aborted
+          log.warn('[SignInStore] account resolved but session has changed')
+          return
+        }
 
+        const { resultCallback } = this.state
+        log.info('[SignInStore] account resolved')
+        const successState: ISuccessState = {
+          kind: SignInStep.Success,
+          resultCallback,
+        }
+        // Commit completion before invoking observers, which can reset the
+        // store or begin another flow. The account has already been saved.
+        this.state = successState
+        this.emitAuthenticate(account)
+        if (this.state === successState) {
+          this.emitUpdate(successState)
+        }
+        resultCallback({ kind: 'success', account })
+      })
+      .catch(e => {
+        // Make sure we're still in the same sign in session
+        if (
+          this.state?.kind === SignInStep.Authentication &&
+          this.state.oauthState?.state === csrfToken
+        ) {
+          log.info('[SignInStore] error with OAuth flow', e)
+          this.setState({ ...this.state, error: e, loading: false })
+        } else {
+          log.info(`[SignInStore] OAuth error but session has changed: ${e}`)
+        }
+      })
+  }
+
+  public async resolveOAuthRequest(action: IOAuthAction) {
     if (!this.state || this.state.kind !== SignInStep.Authentication) {
-      // Looks like the sign in flow has been aborted
       return
     }
 
-    this.emitAuthenticate(account, SignInMethod.Web)
-    this.setState({ kind: SignInStep.Success })
+    if (!this.state.oauthState) {
+      return
+    }
+
+    if (this.state.oauthState.state !== action.state) {
+      log.warn(
+        'requestAuthenticatedUser was not called with valid OAuth state. This is likely due to a browser reloading the callback URL. Contact GitHub Support if you believe this is an error'
+      )
+      return
+    }
+
+    const { endpoint, expectedLogin, oauthState } = this.state
+    if (this.resolvingOAuthState === oauthState.state) {
+      return
+    }
+    this.resolvingOAuthState = oauthState.state
+    // False once the user cancels, restarts, or leaves this browser sign-in.
+    const isSignInAttemptActive = () =>
+      this.state?.kind === SignInStep.Authentication &&
+      this.state.oauthState === oauthState
+    let unpublishedToken: string | undefined
+    try {
+      const credential = await exchangeOAuthToken(
+        getHTMLURL(endpoint),
+        action.code
+      )
+      unpublishedToken = credential.accessToken
+      if (!isSignInAttemptActive()) {
+        return
+      }
+      const account = await fetchUser(endpoint, credential.accessToken, true)
+      if (!isSignInAttemptActive()) {
+        return
+      }
+      // Check before saving so a different browser account isn't signed in.
+      if (
+        expectedLogin !== undefined &&
+        account.login.toLowerCase() !== expectedLogin.toLowerCase()
+      ) {
+        throw new Error(
+          `Please sign in as ${expectedLogin} on ${
+            new URL(getHTMLURL(endpoint)).host
+          }. The browser signed in to a different account.`
+        )
+      }
+      const stored = await this.accountStore.addAccount(account, credential)
+      if (stored !== null) {
+        unpublishedToken = undefined
+      }
+      if (!isSignInAttemptActive()) {
+        return
+      }
+      if (stored === null) {
+        throw new Error(
+          'Unable to save your GitHub credentials. Please try signing in again.'
+        )
+      }
+      oauthState.onAuthCompleted(stored)
+    } catch (e) {
+      oauthState.onAuthError(e)
+    } finally {
+      if (this.resolvingOAuthState === oauthState.state) {
+        this.resolvingOAuthState = undefined
+      }
+      if (unpublishedToken !== undefined) {
+        void this.accountStore.revokeUnusedToken({
+          endpoint,
+          token: unpublishedToken,
+        })
+      }
+    }
   }
 
   /**
@@ -492,35 +430,48 @@ export class SignInStore extends TypedBaseStore<SignInState | null> {
    * This will put the store in the EndpointEntry step ready to
    * receive the url to the enterprise instance.
    */
-  public beginEnterpriseSignIn() {
+  public beginEnterpriseSignIn(
+    resultCallback?: (result: SignInResult) => void
+  ) {
+    if (this.state !== null) {
+      this.reset()
+    }
+
     this.setState({
       kind: SignInStep.EndpointEntry,
       error: null,
       loading: false,
+      resultCallback: resultCallback ?? noop,
     })
   }
 
   /**
-   * Attempt to advance from the EndpointEntry step with the given endpoint
-   * url. This method must only be called when the store is in the authentication
-   * step or an error will be thrown.
+   * Select an endpoint from the entry or existing-account step.
    *
-   * The provided endpoint url will be validated for syntactic correctness as
-   * well as connectivity before the promise resolves. If the endpoint url is
-   * invalid or the host can't be reached the promise will be rejected and the
-   * sign in state updated with an error to be presented to the user.
-   *
-   * If validation is successful the store will advance to the authentication
-   * step.
+   * Invalid URLs leave the current step with an error. When isEndpointFromGit
+   * is true, the authentication state records unfamiliar Enterprise Server
+   * endpoints so the UI can explain how to verify them.
    */
-  public async setEndpoint(url: string): Promise<void> {
+  public async setEndpoint(
+    url: string,
+    isEndpointFromGit = false
+  ): Promise<void> {
     const currentState = this.state
 
-    if (!currentState || currentState.kind !== SignInStep.EndpointEntry) {
+    if (currentState?.kind !== SignInStep.EndpointEntry) {
       const stepText = currentState ? currentState.kind : 'null'
       return fatalError(
         `Sign in step '${stepText}' not compatible with endpoint entry`
       )
+    }
+
+    /**
+     * If the user enters a github.com url in the GitHub Enterprise sign-in
+     * flow we'll redirect them to the GitHub.com sign-in flow.
+     */
+    if (/^(?:https:\/\/)?(?:api\.)?github\.com($|\/)/.test(url)) {
+      this.beginDotComSignIn(currentState.resultCallback)
+      return
     }
 
     this.setState({ ...currentState, loading: true })
@@ -532,11 +483,11 @@ export class SignInStore extends TypedBaseStore<SignInState | null> {
       let error = e
       if (e.name === InvalidURLErrorName) {
         error = new Error(
-          `The GitHub Enterprise instance address doesn't appear to be a valid URL. We're expecting something like https://github.example.com.`
+          `The GitHub Enterprise instance address doesn't appear to be a valid URL. We're expecting something like https://example.ghe.com.`
         )
       } else if (e.name === InvalidProtocolErrorName) {
         error = new Error(
-          'Unsupported protocol. Only http or https is supported when authenticating with GitHub Enterprise instances.'
+          'Unsupported protocol. Only https is supported when authenticating with GitHub Enterprise instances.'
         )
       }
 
@@ -545,140 +496,19 @@ export class SignInStore extends TypedBaseStore<SignInState | null> {
     }
 
     const endpoint = getEnterpriseAPIURL(validUrl)
-    try {
-      const supportsBasicAuth = await this.endpointSupportsBasicAuth(endpoint)
 
-      if (!this.state || this.state.kind !== SignInStep.EndpointEntry) {
-        // Looks like the sign in flow has been aborted
-        return
-      }
+    const existingAccount = this.accounts.find(
+      x => x.endpoint.toLowerCase() === endpoint.toLowerCase()
+    )
 
-      this.setState({
-        kind: SignInStep.Authentication,
-        endpoint,
-        supportsBasicAuth,
-        error: null,
-        loading: false,
-        forgotPasswordUrl: this.getForgotPasswordURL(endpoint),
-      })
-    } catch (e) {
-      let error = e
-      // We'll get an ENOTFOUND if the address couldn't be resolved.
-      if (e.code === 'ENOTFOUND') {
-        error = new Error(
-          'The server could not be found. Please verify that the URL is correct and that you have a stable internet connection.'
-        )
-      }
-
-      this.setState({ ...currentState, loading: false, error })
-    }
-  }
-
-  /**
-   * Attempt to complete the sign in flow with the given OTP token.\
-   * This method must only be called when the store is in the
-   * TwoFactorAuthentication step or an error will be thrown.
-   *
-   * If the provided token is valid the store will advance to
-   * the Success step.
-   *
-   * If an error occurs during sign in (such as invalid credentials)
-   * the authentication state will be updated with that error so that
-   * the responsible component can present it to the user.
-   */
-  public async setTwoFactorOTP(otp: string) {
-    const currentState = this.state
-
-    if (
-      !currentState ||
-      currentState.kind !== SignInStep.TwoFactorAuthentication
-    ) {
-      const stepText = currentState ? currentState.kind : 'null'
-      fatalError(
-        `Sign in step '${stepText}' not compatible with two factor authentication`
-      )
-    }
-
-    this.setState({ ...currentState, loading: true })
-
-    let response: AuthorizationResponse
-
-    try {
-      response = await createAuthorization(
-        currentState.endpoint,
-        currentState.username,
-        currentState.password,
-        otp
-      )
-    } catch (e) {
-      this.emitError(e)
-      return
-    }
-
-    if (!this.state || this.state.kind !== SignInStep.TwoFactorAuthentication) {
-      // Looks like the sign in flow has been aborted
-      return
-    }
-
-    if (response.kind === AuthorizationResponseKind.Authorized) {
-      const token = response.token
-      const user = await fetchUser(currentState.endpoint, token)
-
-      if (
-        !this.state ||
-        this.state.kind !== SignInStep.TwoFactorAuthentication
-      ) {
-        // Looks like the sign in flow has been aborted
-        return
-      }
-
-      this.emitAuthenticate(user, SignInMethod.Basic)
-      this.setState({ kind: SignInStep.Success })
-    } else {
-      switch (response.kind) {
-        case AuthorizationResponseKind.Failed:
-        case AuthorizationResponseKind.TwoFactorAuthenticationRequired:
-          this.setState({
-            ...currentState,
-            loading: false,
-            error: new Error('Two-factor authentication failed.'),
-          })
-          break
-        case AuthorizationResponseKind.Error:
-          this.emitError(
-            new Error(
-              `The server responded with an error (${response.response.status})\n\n${response.response.statusText}`
-            )
-          )
-          break
-        case AuthorizationResponseKind.UserRequiresVerification:
-          this.emitError(
-            new Error(getUnverifiedUserErrorMessage(currentState.username))
-          )
-          break
-        case AuthorizationResponseKind.PersonalAccessTokenBlocked:
-          this.emitError(
-            new Error(
-              'A personal access token cannot be used to login to GitHub Desktop.'
-            )
-          )
-          break
-        case AuthorizationResponseKind.EnterpriseTooOld:
-          this.emitError(new Error(EnterpriseTooOldMessage))
-          break
-        case AuthorizationResponseKind.WebFlowRequired:
-          this.setState({
-            ...currentState,
-            forgotPasswordUrl: this.getForgotPasswordURL(currentState.endpoint),
-            loading: false,
-            supportsBasicAuth: false,
-            kind: SignInStep.Authentication,
-            error: null,
-          })
-          break
-        default:
-          assertNever(response, `Unknown response: ${response}`)
-      }
-    }
+    this.setState({
+      kind: SignInStep.Authentication,
+      endpoint,
+      isUnrecognizedEnterpriseServer:
+        isEndpointFromGit && !existingAccount && isGHES(endpoint),
+      error: null,
+      loading: false,
+      resultCallback: currentState.resultCallback,
+    })
   }
 }

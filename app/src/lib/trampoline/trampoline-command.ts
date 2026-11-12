@@ -1,5 +1,6 @@
 export enum TrampolineCommandIdentifier {
   AskPass = 'ASKPASS',
+  CredentialHelper = 'CREDENTIALHELPER',
 }
 
 /** Represents a command in our trampoline mechanism. */
@@ -13,6 +14,12 @@ export interface ITrampolineCommand {
   readonly identifier: TrampolineCommandIdentifier
 
   /**
+   * Trampoline token sent with this command via the DESKTOP_TRAMPOLINE_TOKEN
+   * environment variable.
+   */
+  readonly trampolineToken: string
+
+  /**
    * Parameters of the command.
    *
    * This corresponds to the command line arguments (argv) except the name of
@@ -22,6 +29,12 @@ export interface ITrampolineCommand {
 
   /** Environment variables that were set when the command was invoked. */
   readonly environmentVariables: ReadonlyMap<string, string>
+
+  /**
+   * The standard input received by the trampoline (note that when running as
+   * an askpass handler the trampoline won't read from stdin)
+   **/
+  readonly stdin: string
 }
 
 /**

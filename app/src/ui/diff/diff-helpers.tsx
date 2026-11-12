@@ -8,7 +8,8 @@ import {
   WorkingDirectoryFileChange,
   CommittedFileChange,
 } from '../../models/status'
-import { DiffHunkExpansionType } from '../../models/diff/raw-diff'
+import { DiffHunk, DiffHunkExpansionType } from '../../models/diff/raw-diff'
+import { DiffLineType, ILargeTextDiff, ITextDiff } from '../../models/diff'
 
 /**
  * DiffRowType defines the different types of
@@ -206,6 +207,21 @@ export type SimplifiedDiffRow =
 export type ChangedFile = WorkingDirectoryFileChange | CommittedFileChange
 
 /**
+ * Whether the row is a type that represent a change (added, deleted, modified)
+ * in the diff. This is useful for checking to see if a row type would have
+ * something like 'hunkStartLine` on it.
+ */
+export function isRowChanged(
+  row: DiffRow | SimplifiedDiffRow
+): row is IDiffRowAdded | IDiffRowDeleted | IDiffRowModified {
+  return (
+    row.type === DiffRowType.Added ||
+    row.type === DiffRowType.Deleted ||
+    row.type === DiffRowType.Modified
+  )
+}
+
+/**
  * Returns an object with two ILineTokens objects that can be used to highlight
  * the added and removed characters between two lines.
  *
@@ -351,4 +367,113 @@ export function canSelect(
   file: ChangedFile
 ): file is WorkingDirectoryFileChange {
   return file instanceof WorkingDirectoryFileChange
+}
+
+/** Gets the width in pixels of the diff line number gutter based on the number of digits in the number */
+export function getLineWidthFromDigitCount(digitAmount: number): number {
+  return Math.max(digitAmount, 3) * 10 + 5
+}
+
+/** Utility function for getting the digit count of the largest line number in an array of diff hunks */
+export function getLargestLineNumber(hunks: DiffHunk[]): number {
+  if (hunks.length === 0) {
+    return 0
+  }
+
+  for (let i = hunks.length - 1; i >= 0; i--) {
+    const hunk = hunks[i]
+
+    for (let j = hunk.lines.length - 1; j >= 0; j--) {
+      const line = hunk.lines[j]
+
+      if (line.type === DiffLineType.Hunk) {
+        continue
+      }
+
+      const newLineNumber = line.newLineNumber ?? 0
+      const oldLineNumber = line.oldLineNumber ?? 0
+      return newLineNumber > oldLineNumber ? newLineNumber : oldLineNumber
+    }
+  }
+
+  return 0
+}
+
+export function getNumberOfDigits(val: number): number {
+  return (Math.log(val) * Math.LOG10E + 1) | 0
+}
+
+/**
+ * The longest line for which we'd try to calculate a line diff, this matches
+ * GitHub.com's behavior.
+ **/
+export const MaxIntraLineDiffStringLength = 1024
+
+/**
+ * Used to obtain classes applied to style the row as first or last of a group
+ * of added or deleted rows in the side-by-side diff.
+ **/
+export function getFirstAndLastClassesSideBySide(
+  row: SimplifiedDiffRow,
+  previousRow: SimplifiedDiffRow | undefined,
+  nextRow: SimplifiedDiffRow | undefined,
+  addedOrDeleted: DiffRowType.Added | DiffRowType.Deleted
+): ReadonlyArray<string> {
+  const classes = new Array<string>()
+  const typesToCheck = [addedOrDeleted, DiffRowType.Modified]
+
+  // Is the row of the type we are checking? No. Then can't be first or last.
+  if (!typesToCheck.includes(row.type)) {
+    return []
+  }
+
+  // Is the previous row exist or is of the type we are checking?
+  // No. Then this row must be the first of this type.
+  if (previousRow === undefined || !typesToCheck.includes(previousRow.type)) {
+    classes.push('is-first')
+  }
+
+  // Is the next row exist or is of the type we are checking?
+  // No. Then this row must be last of this type.
+  if (nextRow === undefined || !typesToCheck.includes(nextRow.type)) {
+    classes.push('is-last')
+  }
+
+  return classes
+}
+
+/**
+ * Compares two text diffs for structural equality.
+ *
+ * Components needing to know whether a re-render is necessary after receiving
+ * a diff is the intended use case.
+ */
+export function textDiffEquals(
+  x: ITextDiff | ILargeTextDiff,
+  y: ITextDiff | ILargeTextDiff
+) {
+  if (x === y) {
+    return true
+  }
+
+  if (
+    x.text === y.text &&
+    x.kind === y.kind &&
+    x.hasHiddenBidiChars === y.hasHiddenBidiChars &&
+    x.lineEndingsChange === y.lineEndingsChange &&
+    x.hunks.length === y.hunks.length
+  ) {
+    // This is a performance optimization which lets us avoid iterating over all
+    // lines (deep equality on all hunks). We're already comparing the diff text
+    // above so the only thing that can change with the diff text staying the
+    // same is whether or not the last line is followed by a trailing newline.
+    // That information is encodeded in the noTrailingNewLine property which
+    // exists on all lines but is only ever set on lines in the last hunk
+    return (
+      x.hunks.length === 0 ||
+      x.hunks[x.hunks.length - 1].equals(y.hunks[y.hunks.length - 1])
+    )
+  }
+
+  return false
 }

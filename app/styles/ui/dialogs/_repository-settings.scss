@@ -1,6 +1,10 @@
 #repository-settings {
   width: 600px;
 
+  .dialog-content {
+    min-height: 305px;
+  }
+
   .no-remote {
     justify-content: space-between;
 
@@ -21,6 +25,16 @@
     }
   }
 
+  .repository-account {
+    margin-top: var(--spacing-double);
+  }
+
+  .repository-account-description {
+    margin-top: var(--spacing-half);
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary-color);
+  }
+
   .fork-settings-description {
     margin-top: var(--spacing-double);
     font-size: var(--font-size-sm);
@@ -30,5 +44,15 @@
       padding: 0;
       margin-bottom: 0;
     }
+  }
+
+  .no-remote-publish-message {
+    .link-button-component {
+      display: inline;
+    }
+  }
+
+  textarea.gitignore {
+    height: 130px;
   }
 }

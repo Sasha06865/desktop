@@ -1,6 +1,8 @@
+import { describe, it } from 'node:test'
+import assert from 'node:assert'
 import {
   lookupPreferredEmail,
-  getAttributableEmailsFor,
+  isAttributableEmailFor,
 } from '../../src/lib/email'
 import {
   IAPIEmail,
@@ -19,10 +21,12 @@ describe('emails', () => {
         [],
         '',
         1234,
-        'Caps Lock'
+        'Caps Lock',
+        'free'
       )
 
-      expect(lookupPreferredEmail(account)).toBe(
+      assert.equal(
+        lookupPreferredEmail(account),
         '1234+shiftkey@users.noreply.github.com'
       )
     })
@@ -35,10 +39,12 @@ describe('emails', () => {
         [],
         '',
         1234,
-        'Caps Lock'
+        'Caps Lock',
+        'free'
       )
 
-      expect(lookupPreferredEmail(account)).toBe(
+      assert.equal(
+        lookupPreferredEmail(account),
         '1234+shiftkey@users.noreply.github.example.com'
       )
     })
@@ -72,10 +78,14 @@ describe('emails', () => {
         emails,
         '',
         -1,
-        'Caps Lock'
+        'Caps Lock',
+        'free'
       )
 
-      expect(lookupPreferredEmail(account)).toBe('my-primary-email@example.com')
+      assert.equal(
+        lookupPreferredEmail(account),
+        'my-primary-email@example.com'
+      )
     })
 
     it('returns the primary if it has null visibility', () => {
@@ -107,10 +117,14 @@ describe('emails', () => {
         emails,
         '',
         -1,
-        'Caps Lock'
+        'Caps Lock',
+        'free'
       )
 
-      expect(lookupPreferredEmail(account)).toBe('my-primary-email@example.com')
+      assert.equal(
+        lookupPreferredEmail(account),
+        'my-primary-email@example.com'
+      )
     })
 
     it('returns the noreply if there is no public address', () => {
@@ -142,10 +156,12 @@ describe('emails', () => {
         emails,
         '',
         -1,
-        'Caps Lock'
+        'Caps Lock',
+        'free'
       )
 
-      expect(lookupPreferredEmail(account)).toBe(
+      assert.equal(
+        lookupPreferredEmail(account),
         'shiftkey@users.noreply.github.com'
       )
     })
@@ -179,10 +195,12 @@ describe('emails', () => {
         emails,
         '',
         -1,
-        'Caps Lock'
+        'Caps Lock',
+        'free'
       )
 
-      expect(lookupPreferredEmail(account)).toBe(
+      assert.equal(
+        lookupPreferredEmail(account),
         'shiftkey@users.noreply.github.example.com'
       )
     })
@@ -210,15 +228,16 @@ describe('emails', () => {
         emails,
         '',
         -1,
-        'Caps Lock'
+        'Caps Lock',
+        'free'
       )
 
-      expect(lookupPreferredEmail(account)).toBe('shiftkey@example.com')
+      assert.equal(lookupPreferredEmail(account), 'shiftkey@example.com')
     })
   })
 
-  describe('getAttributableEmailsFor', () => {
-    it('returns all email addresses on the account as well as legacy and modern stealth emails', () => {
+  describe('isAttributableEmailFor', () => {
+    it('considers all email addresses on the account as well as legacy and modern stealth emails', () => {
       const emails: IAPIEmail[] = [
         {
           email: 'personal@gmail.com',
@@ -241,63 +260,85 @@ describe('emails', () => {
       ]
 
       const endpoint = getDotComAPIEndpoint()
-      const account = new Account('niik', endpoint, '', emails, '', 123, '')
-      const attributable = getAttributableEmailsFor(account)
+      const account = new Account(
+        'niik',
+        endpoint,
+        '',
+        emails,
+        '',
+        123,
+        '',
+        'free'
+      )
 
-      expect(attributable).toEqual([
-        'personal@gmail.com',
-        'company@github.com',
-        'niik@users.noreply.github.com',
-        '123+niik@users.noreply.github.com',
-      ])
+      assert(isAttributableEmailFor(account, 'personal@gmail.com'))
+      assert(isAttributableEmailFor(account, 'company@github.com'))
+      assert.equal(
+        isAttributableEmailFor(account, 'niik@users.noreply.github.com'),
+        true
+      )
+      assert.equal(
+        isAttributableEmailFor(account, '123+niik@users.noreply.github.com'),
+        true
+      )
     })
 
-    it('returns stealth emails when account has no emails', () => {
+    it('considers stealth emails when account has no emails', () => {
       const endpoint = getDotComAPIEndpoint()
-      const account = new Account('niik', endpoint, '', [], '', 123, '')
-      const attributable = getAttributableEmailsFor(account)
+      const account = new Account('niik', endpoint, '', [], '', 123, '', 'free')
 
-      expect(attributable).toEqual([
-        'niik@users.noreply.github.com',
-        '123+niik@users.noreply.github.com',
-      ])
+      assert.equal(
+        isAttributableEmailFor(account, 'niik@users.noreply.github.com'),
+        true
+      )
+      assert.equal(
+        isAttributableEmailFor(account, '123+niik@users.noreply.github.com'),
+        true
+      )
     })
 
-    it('returns stealth emails for GitHub Enterprise', () => {
-      const endpoint = `https://github.example.com/api/v3`
-      const account = new Account('niik', endpoint, '', [], '', 123, '')
-      const attributable = getAttributableEmailsFor(account)
-
-      expect(attributable).toEqual([
-        'niik@users.noreply.github.example.com',
-        '123+niik@users.noreply.github.example.com',
-      ])
-    })
-
-    it('returns unique emails', () => {
-      const emails: IAPIEmail[] = [
-        {
-          email: 'niik@users.noreply.github.com',
-          primary: false,
-          verified: true,
-          visibility: null,
-        },
-        {
-          email: '123+niik@users.noreply.github.com',
-          primary: false,
-          verified: true,
-          visibility: null,
-        },
-      ]
-
+    it('considers stealth emails for GitHub Enterprise', () => {
       const endpoint = getDotComAPIEndpoint()
-      const account = new Account('niik', endpoint, '', emails, '', 123, '')
-      const attributable = getAttributableEmailsFor(account)
+      const account = new Account('niik', endpoint, '', [], '', 123, '', 'free')
 
-      expect(attributable).toEqual([
-        'niik@users.noreply.github.com',
-        '123+niik@users.noreply.github.com',
-      ])
+      assert.equal(
+        isAttributableEmailFor(account, 'niik@users.noreply.github.com'),
+        true
+      )
+      assert.equal(
+        isAttributableEmailFor(account, '123+niik@users.noreply.github.com'),
+        true
+      )
+    })
+
+    it('considers email adresses in a case-insensitive manner', () => {
+      const account = new Account(
+        'niik',
+        getDotComAPIEndpoint(),
+        '',
+        [
+          {
+            email: 'niik@GITHUB.COM',
+            verified: true,
+            primary: true,
+            visibility: 'public',
+          },
+        ],
+        '',
+        123,
+        '',
+        'free'
+      )
+
+      assert(isAttributableEmailFor(account, 'niik@github.com'))
+      assert.equal(
+        isAttributableEmailFor(account, 'niik@users.noreply.github.com'),
+        true
+      )
+      assert.equal(
+        isAttributableEmailFor(account, '123+niik@users.noreply.github.com'),
+        true
+      )
     })
   })
 })

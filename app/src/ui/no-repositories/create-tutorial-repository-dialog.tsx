@@ -7,7 +7,6 @@ import { Ref } from '../lib/ref'
 import { LinkButton } from '../lib/link-button'
 import { Progress } from '../../models/progress'
 import { OkCancelButtonGroup } from '../dialog/ok-cancel-button-group'
-import { friendlyEndpointName } from '../../lib/friendly-endpoint-name'
 
 interface ICreateTutorialRepositoryDialogProps {
   /**
@@ -42,9 +41,7 @@ interface ICreateTutorialRepositoryDialogProps {
  * A dialog component responsible for initializing, publishing, and adding
  * a tutorial repository to the application.
  */
-export class CreateTutorialRepositoryDialog extends React.Component<
-  ICreateTutorialRepositoryDialogProps
-> {
+export class CreateTutorialRepositoryDialog extends React.Component<ICreateTutorialRepositoryDialogProps> {
   public onSubmit = () =>
     this.props.onCreateTutorialRepository(this.props.account)
 
@@ -78,7 +75,7 @@ export class CreateTutorialRepositoryDialog extends React.Component<
         title="Start tutorial"
         onDismissed={this.props.onDismissed}
         onSubmit={this.onSubmit}
-        dismissable={!loading}
+        dismissDisabled={loading}
         loading={loading}
         disabled={loading}
       >
@@ -87,7 +84,7 @@ export class CreateTutorialRepositoryDialog extends React.Component<
             This will create a repository on your local machine, and push it to
             your account <Ref>@{this.props.account.login}</Ref> on{' '}
             <LinkButton uri={getHTMLURL(account.endpoint)}>
-              {friendlyEndpointName(account)}
+              {account.friendlyEndpoint}
             </LinkButton>
             . This repository will only be visible to you, and not visible
             publicly.

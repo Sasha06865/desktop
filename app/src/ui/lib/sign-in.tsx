@@ -1,7 +1,6 @@
 import * as React from 'react'
 import { AuthenticationForm } from './authentication-form'
 import { assertNever } from '../../lib/fatal-error'
-import { TwoFactorAuthentication } from '../lib/two-factor-authentication'
 import { EnterpriseServerEntry } from '../lib/enterprise-server-entry'
 import { Dispatcher } from '../dispatcher'
 import {
@@ -9,8 +8,8 @@ import {
   SignInStep,
   IEndpointEntryState,
   IAuthenticationState,
-  ITwoFactorAuthenticationState,
 } from '../../lib/stores'
+import { EnterpriseServerConfirmation } from './enterprise-server-confirmation'
 
 interface ISignInProps {
   readonly signInState: SignInState
@@ -27,16 +26,8 @@ export class SignIn extends React.Component<ISignInProps, {}> {
     this.props.dispatcher.setSignInEndpoint(url)
   }
 
-  private onCredentialsEntered = (username: string, password: string) => {
-    this.props.dispatcher.setSignInCredentials(username, password)
-  }
-
   private onBrowserSignInRequested = () => {
     this.props.dispatcher.requestBrowserAuthentication()
-  }
-
-  private onOTPEntered = (otp: string) => {
-    this.props.dispatcher.setSignInOTP(otp)
   }
 
   private renderEndpointEntryStep(state: IEndpointEntryState) {
@@ -53,32 +44,18 @@ export class SignIn extends React.Component<ISignInProps, {}> {
 
   private renderAuthenticationStep(state: IAuthenticationState) {
     const children = this.props.children as ReadonlyArray<JSX.Element>
+    const confirmation = state.isUnrecognizedEnterpriseServer ? (
+      <EnterpriseServerConfirmation endpoint={state.endpoint} />
+    ) : null
 
     return (
-      <AuthenticationForm
-        loading={state.loading}
-        error={state.error}
-        supportsBasicAuth={state.supportsBasicAuth}
-        additionalButtons={children}
-        onBrowserSignInRequested={this.onBrowserSignInRequested}
-        onSubmit={this.onCredentialsEntered}
-        forgotPasswordUrl={state.forgotPasswordUrl}
-        endpoint={state.endpoint}
-      />
-    )
-  }
-
-  private renderTwoFactorAuthenticationStep(
-    state: ITwoFactorAuthenticationState
-  ) {
-    return (
-      <TwoFactorAuthentication
-        loading={state.loading}
-        error={state.error}
-        type={state.type}
-        additionalButtons={this.props.children}
-        onOTPEntered={this.onOTPEntered}
-      />
+      <>
+        {confirmation}
+        <AuthenticationForm
+          additionalButtons={children}
+          onBrowserSignInRequested={this.onBrowserSignInRequested}
+        />
+      </>
     )
   }
 
@@ -91,8 +68,6 @@ export class SignIn extends React.Component<ISignInProps, {}> {
         return this.renderEndpointEntryStep(state)
       case SignInStep.Authentication:
         return this.renderAuthenticationStep(state)
-      case SignInStep.TwoFactorAuthentication:
-        return this.renderTwoFactorAuthenticationStep(state)
       case SignInStep.Success:
         return null
       default:

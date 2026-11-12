@@ -1,21 +1,11 @@
 import * as React from 'react'
-import classNames from 'classnames'
 import { dragAndDropManager } from '../lib/drag-and-drop-manager'
+import { TabBarItem } from './tab-bar-item'
+import { TabBarType } from './tab-bar-type'
+export { TabBarType } from './tab-bar-type'
 
 /** Time to wait for drag element hover before switching tabs */
 const dragTabSwitchWaitTime = 500
-
-/** The tab bar type. */
-export enum TabBarType {
-  /** Standard tabs */
-  Tabs,
-
-  /** Simpler switch appearance */
-  Switch,
-
-  /** Vertical tabs */
-  Vertical,
-}
 
 interface ITabBarProps {
   /** The currently selected tab. */
@@ -122,90 +112,30 @@ export class TabBar extends React.Component<ITabBarProps, {}> {
   }
 
   private renderItems() {
+    const { type, selectedIndex } = this.props
     const children = React.Children.toArray(this.props.children)
 
     return children.map((child, index) => {
-      const selected = index === this.props.selectedIndex
+      const selected = index === selectedIndex
       return (
-        <TabBarItem
-          key={index}
-          selected={selected}
-          index={index}
-          onClick={this.onTabClicked}
-          onMouseEnter={this.onMouseEnter}
-          onMouseLeave={this.onMouseLeave}
-          onSelectAdjacent={this.onSelectAdjacentTab}
-          onButtonRef={this.onTabRef}
-          type={this.props.type}
-        >
-          {child}
-        </TabBarItem>
+        <React.Fragment key={index}>
+          <TabBarItem
+            selected={selected}
+            index={index}
+            onClick={this.onTabClicked}
+            onMouseEnter={this.onMouseEnter}
+            onMouseLeave={this.onMouseLeave}
+            onSelectAdjacent={this.onSelectAdjacentTab}
+            onButtonRef={this.onTabRef}
+            type={type}
+          >
+            {child}
+          </TabBarItem>
+          {type === TabBarType.Switch && index < children.length - 1 && (
+            <div className="tab-bar-separator" />
+          )}
+        </React.Fragment>
       )
     })
-  }
-}
-
-interface ITabBarItemProps {
-  readonly index: number
-  readonly selected: boolean
-  readonly onClick: (index: number) => void
-  readonly onMouseEnter: (index: number) => void
-  readonly onMouseLeave: () => void
-  readonly onSelectAdjacent: (
-    direction: 'next' | 'previous',
-    index: number
-  ) => void
-  readonly onButtonRef: (
-    index: number,
-    button: HTMLButtonElement | null
-  ) => void
-  readonly type?: TabBarType
-}
-
-class TabBarItem extends React.Component<ITabBarItemProps, {}> {
-  private onClick = (event: React.MouseEvent<HTMLButtonElement>) => {
-    this.props.onClick(this.props.index)
-  }
-
-  private onKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    const { type, index } = this.props
-    const previousKey = type === TabBarType.Vertical ? 'ArrowUp' : 'ArrowLeft'
-    const nextKey = type === TabBarType.Vertical ? 'ArrowDown' : 'ArrowRight'
-    if (event.key === previousKey) {
-      this.props.onSelectAdjacent('previous', index)
-      event.preventDefault()
-    } else if (event.key === nextKey) {
-      this.props.onSelectAdjacent('next', index)
-      event.preventDefault()
-    }
-  }
-
-  private onButtonRef = (buttonRef: HTMLButtonElement | null) => {
-    this.props.onButtonRef(this.props.index, buttonRef)
-  }
-
-  private onMouseEnter = () => {
-    this.props.onMouseEnter(this.props.index)
-  }
-
-  public render() {
-    const selected = this.props.selected
-    const className = classNames('tab-bar-item', { selected })
-    return (
-      <button
-        ref={this.onButtonRef}
-        className={className}
-        onClick={this.onClick}
-        role="tab"
-        aria-selected={selected}
-        tabIndex={selected ? undefined : -1}
-        onKeyDown={this.onKeyDown}
-        onMouseEnter={this.onMouseEnter}
-        onMouseLeave={this.props.onMouseLeave}
-        type="button"
-      >
-        {this.props.children}
-      </button>
-    )
   }
 }

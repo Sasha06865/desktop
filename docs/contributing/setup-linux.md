@@ -2,9 +2,8 @@
 
 You will need to install these tools on your machine:
 
- - Node.js
- - Yarn
- - Python 2
+ - Node.js (includes npm)
+ - Python 3
  - Electron dependencies
 
 ## Node.js
@@ -18,24 +17,19 @@ and follow the instructions to install the version you require.
 Ensure that you also choose the option for building native Node modules, as
 those are used in some dependencies used in GitHub Desktop.
 
-## Yarn
+## npm
 
-Follow [this guide](https://yarnpkg.com/en/docs/install) to install
-a system-level `yarn` for your distribution. GitHub Desktop uses a local version
-of `yarn`, but it needs a version on your `PATH` to bootstrap itself.
+Use the npm version bundled with Node.js. Some distributions provide npm as a
+separate package; verify both `node -v` and `npm -v` are available on your `PATH`.
 
-This is important because `yarn` uses lock files to pin dependencies. If you
-find yourself changing packages, this will prevent mismatches in versions
-between machines.
+Desktop uses `package-lock.json` files to pin dependencies across machines.
+See [working with packages](./working-with-packages.md) for installation,
+dependency updates, and script commands.
 
-If you're not familiar with `yarn`, please read [this document](./working-with-packages.md)
-to help familiarize yourself with how to do the common package tasks that are
-relevant to Desktop.
-
-## Python 2
+## Python 3
 
 Refer to your distributions package manager to obtain the latest version of the
-Python 2 series.
+Python 3 series.
 
 ## Electron dependencies
 

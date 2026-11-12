@@ -2,17 +2,17 @@ import * as React from 'react'
 import { UiView } from '../ui-view'
 import { Button } from '../lib/button'
 import { Octicon, OcticonSymbol } from '../octicons'
+import * as octicons from '../octicons/octicons.generated'
 import {
   WelcomeLeftTopImageUri,
   WelcomeLeftBottomImageUri,
 } from '../welcome/welcome'
 import { IAccountRepositories } from '../../lib/stores/api-repositories-store'
-import { Account } from '../../models/account'
-import { TabBar } from '../tab-bar'
+import { Account, accountEquals } from '../../models/account'
 import { CloneableRepositoryFilterList } from '../clone-repository/cloneable-repository-filter-list'
 import { IAPIRepository } from '../../lib/api'
-import { assertNever } from '../../lib/fatal-error'
 import { ClickSource } from '../lib/list'
+import { AccountPicker } from '../account-picker'
 
 interface INoRepositoriesProps {
   /** A function to call when the user chooses to create a repository. */
@@ -33,11 +33,7 @@ interface INoRepositoriesProps {
   /** true if tutorial is in paused state. */
   readonly tutorialPaused: boolean
 
-  /** The logged in account for GitHub.com. */
-  readonly dotComAccount: Account | null
-
-  /** The logged in account for GitHub Enterprise. */
-  readonly enterpriseAccount: Account | null
+  readonly accounts: ReadonlyArray<Account>
 
   /**
    * A map keyed on a user account (GitHub.com or GitHub Enterprise)
@@ -61,48 +57,16 @@ interface INoRepositoriesProps {
    */
   readonly onRefreshRepositories: (account: Account) => void
 }
-
-/**
- * An enumeration of all the tabs potentially available for
- * selection.
- */
-enum AccountTab {
-  dotCom,
-  enterprise,
-}
-
 interface INoRepositoriesState {
+  readonly selectedAccount: Account | undefined
   /**
-   * The selected account, or rather the preferred selection.
-   * Has no effect when the user isn't signed in to any account.
-   * If the selected account is GitHub.com and the user signs out
-   * of that account they will be coerced onto the Enterprise tab
-   * if that account is signed in, see the getSelectedAccount
-   * method.
+   * The currently selected repository (if any)
    */
-  readonly selectedTab: AccountTab
-
-  /**
-   * The currently selected repository (if any) in the GitHub.com
-   * tab.
-   */
-  readonly selectedDotComRepository: IAPIRepository | null
-
+  readonly selectedRepository: IAPIRepository | null
   /**
    * The current filter text in the GitHub.com clone tab
    */
-  readonly dotComFilterText: string
-
-  /**
-   * The currently selected repository (if any) in the GitHub
-   * Enterprise tab.
-   */
-  readonly selectedEnterpriseRepository: IAPIRepository | null
-
-  /**
-   * The current filter text in the GitHub.com clone tab
-   */
-  readonly enterpriseFilterText: string
+  readonly filterText: string
 }
 
 /**
@@ -113,62 +77,77 @@ export class NoRepositoriesView extends React.Component<
   INoRepositoriesProps,
   INoRepositoriesState
 > {
+  private get selectedAccount() {
+    return this.state.selectedAccount ?? this.props.accounts.at(0)
+  }
+
   public constructor(props: INoRepositoriesProps) {
     super(props)
 
     this.state = {
-      selectedTab: AccountTab.dotCom,
-      dotComFilterText: '',
-      enterpriseFilterText: '',
-      selectedDotComRepository: null,
-      selectedEnterpriseRepository: null,
+      selectedRepository: null,
+      selectedAccount: props.accounts.at(0),
+      filterText: '',
     }
   }
 
   public render() {
     return (
       <UiView id="no-repositories">
-        <header>
-          <h1>Let's get started!</h1>
-          <p>Add a repository to GitHub Desktop to start collaborating</p>
-        </header>
+        <section aria-label="Let's get started!">
+          <header>
+            <h1>Let's get started!</h1>
+            <p>Add a repository to GitHub Desktop to start collaborating</p>
+          </header>
 
-        <div className="content">
-          {this.renderGetStartedActions()}
-          {this.renderRepositoryList()}
-        </div>
+          <div className="content">
+            {this.renderRepositoryList()}
+            {this.renderGetStartedActions()}
+          </div>
 
-        <img
-          className="no-repositories-graphic-top"
-          src={WelcomeLeftTopImageUri}
-        />
-        <img
-          className="no-repositories-graphic-bottom"
-          src={WelcomeLeftBottomImageUri}
-        />
+          <img
+            className="no-repositories-graphic-top"
+            src={WelcomeLeftTopImageUri}
+            alt=""
+          />
+          <img
+            className="no-repositories-graphic-bottom"
+            src={WelcomeLeftBottomImageUri}
+            alt=""
+          />
+        </section>
       </UiView>
     )
   }
 
   public componentDidMount() {
-    this.ensureRepositoriesForAccount(this.getSelectedAccount())
+    if (this.state.selectedAccount) {
+      this.ensureRepositoriesForAccount(this.state.selectedAccount)
+    }
   }
 
   public componentDidUpdate(
     prevProps: INoRepositoriesProps,
     prevState: INoRepositoriesState
   ) {
-    if (
-      prevProps.dotComAccount !== this.props.dotComAccount ||
-      prevProps.enterpriseAccount !== this.props.enterpriseAccount ||
-      prevState.selectedTab !== this.state.selectedTab
-    ) {
-      this.ensureRepositoriesForAccount(this.getSelectedAccount())
+    if (prevProps.accounts !== this.props.accounts) {
+      const currentlySelectedAccount = this.state.selectedAccount
+      const newSelectedAccount =
+        (currentlySelectedAccount
+          ? this.props.accounts.find(a =>
+              accountEquals(a, currentlySelectedAccount)
+            )
+          : undefined) ?? this.props.accounts.at(0)
+
+      if (currentlySelectedAccount !== newSelectedAccount) {
+        this.setState({ selectedAccount: newSelectedAccount })
+        this.ensureRepositoriesForAccount(this.state.selectedAccount)
+      }
     }
   }
 
-  private ensureRepositoriesForAccount(account: Account | null) {
-    if (account !== null) {
+  private ensureRepositoriesForAccount(account: Account | undefined) {
+    if (account) {
       const accountState = this.props.apiRepositories.get(account)
 
       if (accountState === undefined) {
@@ -177,21 +156,14 @@ export class NoRepositoriesView extends React.Component<
     }
   }
 
-  private getSelectedAccount() {
-    const { selectedTab } = this.state
-    if (selectedTab === AccountTab.dotCom) {
-      return this.props.dotComAccount || this.props.enterpriseAccount
-    } else if (selectedTab === AccountTab.enterprise) {
-      return this.props.enterpriseAccount || this.props.dotComAccount
-    } else {
-      return assertNever(selectedTab, `Unknown account tab ${selectedTab}`)
-    }
+  private isUserSignedIn() {
+    return this.props.accounts.length > 0
   }
 
   private renderRepositoryList() {
-    const account = this.getSelectedAccount()
+    const account = this.selectedAccount
 
-    if (account === null) {
+    if (!account) {
       // not signed in to any accounts
       return null
     }
@@ -200,16 +172,31 @@ export class NoRepositoriesView extends React.Component<
 
     return (
       <div className="content-pane repository-list">
-        {this.renderAccountsTabBar()}
+        {this.renderAccountPicker()}
         {this.renderAccountRepositoryList(account, accountState)}
       </div>
     )
   }
 
-  private getSelectedItemForAccount(account: Account) {
-    return account === this.props.dotComAccount
-      ? this.state.selectedDotComRepository
-      : this.state.selectedEnterpriseRepository
+  private renderAccountPicker() {
+    const { accounts } = this.props
+    const selectedAccount = this.selectedAccount
+    if (accounts.length < 2 || !selectedAccount) {
+      return null
+    }
+
+    return (
+      <AccountPicker
+        accounts={accounts}
+        selectedAccount={selectedAccount}
+        onSelectedAccountChanged={this.onSelectedAccountChanged}
+      />
+    )
+  }
+
+  private onSelectedAccountChanged = (selectedAccount: Account) => {
+    this.setState({ selectedAccount })
+    this.ensureRepositoriesForAccount(selectedAccount)
   }
 
   private renderAccountRepositoryList(
@@ -221,19 +208,14 @@ export class NoRepositoriesView extends React.Component<
     const repositories =
       accountState === undefined ? null : accountState.repositories
 
-    const selectedItem = this.getSelectedItemForAccount(account)
-
-    const filterText =
-      account === this.props.dotComAccount
-        ? this.state.dotComFilterText
-        : this.state.enterpriseFilterText
+    const selectedItem = this.state.selectedRepository
 
     return (
       <>
         <CloneableRepositoryFilterList
           account={account}
           selectedItem={selectedItem}
-          filterText={filterText}
+          filterText={this.state.filterText}
           onRefreshRepositories={this.props.onRefreshRepositories}
           loading={loading}
           repositories={repositories}
@@ -274,63 +256,19 @@ export class NoRepositoriesView extends React.Component<
   }
 
   private onCloneSelectedRepository = () => {
-    const selectedAccount = this.getSelectedAccount()
-    if (selectedAccount === null) {
-      return
+    const selectedItem = this.state.selectedRepository
+
+    if (selectedItem !== null) {
+      this.props.onClone(selectedItem.clone_url)
     }
-
-    const selectedItem = this.getSelectedItemForAccount(selectedAccount)
-
-    if (selectedItem === null) {
-      return
-    }
-
-    this.props.onClone(selectedItem.clone_url)
   }
 
-  private onSelectionChanged = (selectedItem: IAPIRepository | null) => {
-    const account = this.getSelectedAccount()
-    if (account === this.props.dotComAccount) {
-      this.setState({ selectedDotComRepository: selectedItem })
-    } else if (account === this.props.enterpriseAccount) {
-      this.setState({ selectedEnterpriseRepository: selectedItem })
-    }
+  private onSelectionChanged = (selectedRepository: IAPIRepository | null) => {
+    this.setState({ selectedRepository })
   }
 
   private onFilterTextChanged = (filterText: string) => {
-    const account = this.getSelectedAccount()
-    if (account === this.props.dotComAccount) {
-      this.setState({ dotComFilterText: filterText })
-    } else if (account === this.props.enterpriseAccount) {
-      this.setState({ enterpriseFilterText: filterText })
-    }
-  }
-
-  private renderAccountsTabBar() {
-    if (
-      this.props.dotComAccount === null ||
-      this.props.enterpriseAccount === null
-    ) {
-      return null
-    }
-
-    const selectedIndex =
-      this.getSelectedAccount() === this.props.dotComAccount ? 0 : 1
-
-    return (
-      <TabBar selectedIndex={selectedIndex} onTabClicked={this.onTabClicked}>
-        <span>GitHub.com</span>
-        <span>GitHub Enterprise</span>
-      </TabBar>
-    )
-  }
-
-  private onTabClicked = (index: number) => {
-    if (index === 0) {
-      this.setState({ selectedTab: AccountTab.dotCom })
-    } else if (index === 1) {
-      this.setState({ selectedTab: AccountTab.enterprise })
-    }
+    this.setState({ filterText })
   }
 
   // Note: this wrapper is necessary in order to ensure
@@ -343,30 +281,28 @@ export class NoRepositoriesView extends React.Component<
     symbol: OcticonSymbol,
     title: string,
     onClick: () => void,
-    type?: 'submit'
+    type?: 'submit',
+    autoFocus?: boolean
   ) {
     return (
-      <li>
-        <Button onClick={onClick} type={type}>
+      <span>
+        <Button onClick={onClick} type={type} autoFocus={autoFocus}>
           <Octicon symbol={symbol} />
           <div>{title}</div>
         </Button>
-      </li>
+      </span>
     )
   }
 
   private renderTutorialRepositoryButton() {
     // No tutorial if you're not signed in.
-    if (
-      this.props.dotComAccount === null &&
-      this.props.enterpriseAccount === null
-    ) {
+    if (!this.isUserSignedIn()) {
       return null
     }
 
     if (this.props.tutorialPaused) {
       return this.renderButtonGroupButton(
-        OcticonSymbol.mortarBoard,
+        octicons.mortarBoard,
         __DARWIN__
           ? 'Return to In Progress Tutorial'
           : 'Return to in progress tutorial',
@@ -375,7 +311,7 @@ export class NoRepositoriesView extends React.Component<
       )
     } else {
       return this.renderButtonGroupButton(
-        OcticonSymbol.mortarBoard,
+        octicons.mortarBoard,
         __DARWIN__
           ? 'Create a Tutorial Repository…'
           : 'Create a tutorial repository…',
@@ -387,30 +323,32 @@ export class NoRepositoriesView extends React.Component<
 
   private renderCloneButton() {
     return this.renderButtonGroupButton(
-      OcticonSymbol.repoClone,
+      octicons.repoClone,
       __DARWIN__
         ? 'Clone a Repository from the Internet…'
         : 'Clone a repository from the Internet…',
-      this.onShowClone
+      this.onShowClone,
+      undefined,
+      !this.isUserSignedIn()
     )
   }
 
   private renderCreateRepositoryButton() {
     return this.renderButtonGroupButton(
-      OcticonSymbol.plus,
+      octicons.plus,
       __DARWIN__
-        ? 'Create a New Repository on your Hard Drive…'
-        : 'Create a New Repository on your hard drive…',
+        ? 'Create a New Repository on your Local Drive…'
+        : 'Create a New Repository on your local drive…',
       this.props.onCreate
     )
   }
 
   private renderAddExistingRepositoryButton() {
     return this.renderButtonGroupButton(
-      OcticonSymbol.fileDirectory,
+      octicons.fileDirectory,
       __DARWIN__
-        ? 'Add an Existing Repository from your Hard Drive…'
-        : 'Add an Existing Repository from your hard drive…',
+        ? 'Add an Existing Repository from your Local Drive…'
+        : 'Add an Existing Repository from your local drive…',
       this.props.onAdd
     )
   }
@@ -418,15 +356,15 @@ export class NoRepositoriesView extends React.Component<
   private renderGetStartedActions() {
     return (
       <div className="content-pane">
-        <ul className="button-group">
+        <div className="button-group">
           {this.renderTutorialRepositoryButton()}
           {this.renderCloneButton()}
           {this.renderCreateRepositoryButton()}
           {this.renderAddExistingRepositoryButton()}
-        </ul>
+        </div>
 
         <div className="drag-drop-info">
-          <Octicon symbol={OcticonSymbol.lightBulb} />
+          <Octicon symbol={octicons.lightBulb} />
           <div>
             <strong>ProTip!</strong> You can drag &amp; drop an existing
             repository folder here to add it to Desktop

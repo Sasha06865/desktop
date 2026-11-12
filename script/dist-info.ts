@@ -2,14 +2,12 @@ import * as Path from 'path'
 import * as Fs from 'fs'
 
 import { getProductName, getVersion } from '../app/package-info'
-import { getReleaseBranchName } from './build-platforms'
+import { join } from 'path'
 
 const productName = getProductName()
 const version = getVersion()
 
 const projectRoot = Path.join(__dirname, '..')
-
-const publishChannels = ['production', 'test', 'beta']
 
 export function getDistRoot() {
   return Path.join(projectRoot, 'dist')
@@ -18,7 +16,7 @@ export function getDistRoot() {
 export function getDistPath() {
   return Path.join(
     getDistRoot(),
-    `${getExecutableName()}-${process.platform}-${getArchitecture()}`
+    `${getExecutableName()}-${process.platform}-${getDistArchitecture()}`
   )
 }
 
@@ -35,7 +33,7 @@ export function getExecutableName() {
 }
 
 export function getOSXZipName() {
-  return `${productName}-${getArchitecture()}.zip`
+  return `${productName}-${getDistArchitecture()}.zip`
 }
 
 export function getOSXZipPath() {
@@ -44,7 +42,7 @@ export function getOSXZipPath() {
 
 export function getWindowsInstallerName() {
   const productName = getExecutableName()
-  return `${productName}Setup-${getArchitecture()}.msi`
+  return `${productName}Setup-${getDistArchitecture()}.msi`
 }
 
 export function getWindowsInstallerPath() {
@@ -53,7 +51,7 @@ export function getWindowsInstallerPath() {
 
 export function getWindowsStandaloneName() {
   const productName = getExecutableName()
-  return `${productName}Setup-${getArchitecture()}.exe`
+  return `${productName}Setup-${getDistArchitecture()}.exe`
 }
 
 export function getWindowsStandalonePath() {
@@ -63,7 +61,9 @@ export function getWindowsStandalonePath() {
 export function getWindowsFullNugetPackageName(
   includeArchitecture: boolean = false
 ) {
-  const architectureInfix = includeArchitecture ? `-${getArchitecture()}` : ''
+  const architectureInfix = includeArchitecture
+    ? `-${getDistArchitecture()}`
+    : ''
   return `${getWindowsIdentifierName()}-${version}${architectureInfix}-full.nupkg`
 }
 
@@ -79,7 +79,9 @@ export function getWindowsFullNugetPackagePath() {
 export function getWindowsDeltaNugetPackageName(
   includeArchitecture: boolean = false
 ) {
-  const architectureInfix = includeArchitecture ? `-${getArchitecture()}` : ''
+  const architectureInfix = includeArchitecture
+    ? `-${getDistArchitecture()}`
+    : ''
   return `${getWindowsIdentifierName()}-${version}${architectureInfix}-delta.nupkg`
 }
 
@@ -97,49 +99,21 @@ export function getWindowsIdentifierName() {
 }
 
 export function getBundleSizes() {
-  // eslint-disable-next-line no-sync
-  const rendererStats = Fs.statSync(
-    Path.join(projectRoot, 'out', 'renderer.js')
-  )
-  // eslint-disable-next-line no-sync
-  const mainStats = Fs.statSync(Path.join(projectRoot, 'out', 'main.js'))
-  return { rendererSize: rendererStats.size, mainSize: mainStats.size }
-}
-
-export function isPublishable(): boolean {
-  const channelFromBranch = getChannelFromBranch()
-  return channelFromBranch !== undefined
-    ? publishChannels.includes(channelFromBranch)
-    : false
-}
-
-export function getChannel() {
-  const channelFromBranch = getChannelFromBranch()
-  return channelFromBranch !== undefined
-    ? channelFromBranch
-    : process.env.NODE_ENV || 'development'
-}
-
-function getChannelFromBranch(): string | undefined {
-  // Branch name format: __release-CHANNEL-DEPLOY_ID
-  const pieces = getReleaseBranchName().split('-')
-  if (pieces.length < 3 || pieces[0] !== '__release') {
-    return
+  const outPath = Path.join(projectRoot, 'out')
+  return {
+    // eslint-disable-next-line no-sync
+    rendererBundleSize: Fs.statSync(Path.join(outPath, 'renderer.js')).size,
+    // eslint-disable-next-line no-sync
+    mainBundleSize: Fs.statSync(Path.join(outPath, 'main.js')).size,
   }
-  return pieces[1]
 }
+export const isPublishable = () =>
+  ['production', 'beta', 'test'].includes(getChannel())
 
-export function getReleaseSHA() {
-  // Branch name format: __release-CHANNEL-DEPLOY_ID
-  const pieces = getReleaseBranchName().split('-')
-  if (pieces.length < 3 || pieces[0] !== '__release') {
-    return null
-  }
+export const getChannel = () =>
+  process.env.RELEASE_CHANNEL ?? process.env.NODE_ENV ?? 'development'
 
-  return pieces[2]
-}
-
-export function getArchitecture(): 'arm64' | 'x64' {
+export function getDistArchitecture(): 'arm64' | 'x64' {
   // If a specific npm_config_arch is set, we use that one instead of the OS arch (to support cross compilation)
   if (
     process.env.npm_config_arch === 'arm64' ||
@@ -162,17 +136,42 @@ export function getArchitecture(): 'arm64' | 'x64' {
 }
 
 export function getUpdatesURL() {
-  return `https://central.github.com/api/deployments/desktop/desktop/latest?version=${version}&env=${getChannel()}&architecture=${getArchitecture()}`
+  // It is also possible to use a `x64/` path, but for now we'll leave the
+  // original URL without architecture in it (which will still work for
+  // compatibility reasons) in case anything goes wrong until we have everything
+  // sorted out.
+  const architecturePath = getDistArchitecture() === 'arm64' ? 'arm64/' : ''
+  return `https://central.github.com/api/deployments/desktop/desktop/${architecturePath}latest?version=${version}&env=${getChannel()}`
 }
 
 export function shouldMakeDelta() {
   // Only production and beta channels include deltas. Test releases aren't
   // necessarily sequential so deltas wouldn't make sense.
-  const channelsWithDeltas = ['production', 'beta']
-  return channelsWithDeltas.indexOf(getChannel()) > -1
+  return ['production', 'beta'].includes(getChannel())
 }
 
-export function getIconFileName(): string {
-  const baseName = 'icon-logo'
-  return getChannel() === 'development' ? `${baseName}-yellow` : baseName
+/**
+ * Path to the directory containing all icon assets for the current release channel.
+ */
+export function getIconDirectory() {
+  const devOrProd = getChannel() === 'development' ? 'dev' : 'prod'
+  return join(projectRoot, 'app', 'static', 'logos', devOrProd)
+}
+
+export function getChannelFromReleaseBranch(): string {
+  const branchName = process.env.GITHUB_HEAD_REF ?? ''
+
+  if (!branchName.includes('releases/')) {
+    return 'development'
+  }
+
+  if (getVersion().includes('test')) {
+    return 'test'
+  }
+
+  if (getVersion().includes('beta')) {
+    return 'beta'
+  }
+
+  return 'production'
 }

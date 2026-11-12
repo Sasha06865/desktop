@@ -1,15 +1,16 @@
-import { git, gitNetworkArguments, IGitExecutionOptions } from './core'
+import { git, IGitStringExecutionOptions } from './core'
 
 import { Repository } from '../../models/repository'
 import { Commit } from '../../models/commit'
 import { IRevertProgress } from '../../models/progress'
-import { IGitAccount } from '../../models/git-account'
 
 import { executionOptionsWithProgress } from '../progress/from-process'
 import { RevertProgressParser } from '../progress/revert'
-import { getFallbackUrlForProxyResolve } from './environment'
-import { merge } from '../merge'
-import { withTrampolineEnvForRemoteOperation } from '../trampoline/trampoline-environment'
+import {
+  envForRemoteOperation,
+  getFallbackUrlForProxyResolve,
+} from './environment'
+import { IRemote } from '../../models/remote'
 
 /**
  * Creates a new commit that reverts the changes of a previous commit
@@ -17,27 +18,27 @@ import { withTrampolineEnvForRemoteOperation } from '../trampoline/trampoline-en
  * @param repository  - The repository to update
  *
  * @param commit         - The SHA of the commit to be reverted
- *
  */
 export async function revertCommit(
   repository: Repository,
   commit: Commit,
-  account: IGitAccount | null,
+  currentRemote: IRemote | null,
   progressCallback?: (progress: IRevertProgress) => void
 ) {
-  const networkArguments = await gitNetworkArguments(repository, account)
-
-  const args = [...networkArguments, 'revert']
+  const args = ['revert']
   if (commit.parentSHAs.length > 1) {
     args.push('-m', '1')
   }
 
   args.push(commit.sha)
 
-  let opts: IGitExecutionOptions = {}
+  let opts: IGitStringExecutionOptions = {}
   if (progressCallback) {
+    const env = await envForRemoteOperation(
+      getFallbackUrlForProxyResolve(repository, currentRemote)
+    )
     opts = await executionOptionsWithProgress(
-      { trackLFSProgress: true },
+      { env, trackLFSProgress: true },
       new RevertProgressParser(),
       progress => {
         const description =
@@ -50,14 +51,5 @@ export async function revertCommit(
     )
   }
 
-  await withTrampolineEnvForRemoteOperation(
-    account,
-    getFallbackUrlForProxyResolve(account, repository),
-    env => {
-      return git(args, repository.path, 'revert', {
-        ...opts,
-        env: merge(opts.env, env),
-      })
-    }
-  )
+  await git(args, repository.path, 'revert', opts)
 }

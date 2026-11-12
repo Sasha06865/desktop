@@ -1,56 +1,19 @@
 import * as React from 'react'
 import { PublishRepository } from './publish-repository'
 import { Dispatcher } from '../dispatcher'
-import { Account } from '../../models/account'
+import { Account, isDotComAccount, isSameAccount } from '../../models/account'
 import { Repository } from '../../models/repository'
 import { Dialog, DialogFooter, DialogContent, DialogError } from '../dialog'
-import { TabBar } from '../tab-bar'
-import { getDotComAPIEndpoint } from '../../lib/api'
-import { assertNever, fatalError } from '../../lib/fatal-error'
 import { CallToAction } from '../lib/call-to-action'
+import { LinkButton } from '../lib/link-button'
+import { Row } from '../lib/row'
 import { getGitDescription } from '../../lib/git'
 import {
-  IDotcomPublicationSettings,
-  IEnterprisePublicationSettings,
   RepositoryPublicationSettings,
   PublishSettingsType,
 } from '../../models/publish-settings'
 import { OkCancelButtonGroup } from '../dialog/ok-cancel-button-group'
-
-enum PublishTab {
-  DotCom = 0,
-  Enterprise,
-}
-
-type TabState = IDotcomTabState | IEnterpriseTabState
-
-interface IDotcomTabState {
-  readonly kind: 'dotcom'
-
-  /** The settings for publishing the repository. */
-  readonly settings: IDotcomPublicationSettings
-
-  /**
-   * An error which, if present, is presented to the
-   * user in close proximity to the actions or input fields
-   * related to the current step.
-   */
-  readonly error: Error | null
-}
-
-interface IEnterpriseTabState {
-  readonly kind: 'enterprise'
-
-  /** The settings for publishing the repository. */
-  readonly settings: IEnterprisePublicationSettings
-
-  /**
-   * An error which, if present, is presented to the
-   * user in close proximity to the actions or input fields
-   * related to the current step.
-   */
-  readonly error: Error | null
-}
+import { SignInResult } from '../../lib/stores/sign-in-store'
 
 interface IPublishProps {
   readonly dispatcher: Dispatcher
@@ -66,66 +29,94 @@ interface IPublishProps {
 }
 
 interface IPublishState {
-  /** The currently selected tab. */
-  readonly currentTab: PublishTab
-  readonly dotcomTabState: IDotcomTabState
-  readonly enterpriseTabState: IEnterpriseTabState
+  /** The settings for publishing the repository. */
+  readonly settings: RepositoryPublicationSettings
+
+  /**
+   * An error which, if present, is presented to the
+   * user in close proximity to the actions or input fields
+   * related to the current step.
+   */
+  readonly error: Error | null
+
+  /**
+   * The account the user chose (or which was chosen for them) to publish
+   * with. See `getSelectedAccount` for the account actually used.
+   */
+  readonly selectedAccount: Account | null
 
   /** Is the repository currently being published? */
   readonly publishing: boolean
 }
 
 /**
+ * The signed-in account assigned to the repository, if any.
+ *
+ * A repository whose remote has been removed keeps its account assignment, so
+ * publishing it again starts out with that account selected.
+ */
+function getAssignedAccount(
+  repository: Repository,
+  accounts: ReadonlyArray<Account>
+): Account | null {
+  const { gitHubRepository, login } = repository
+  if (gitHubRepository === null || login === null) {
+    return null
+  }
+  const assigned = { endpoint: gitHubRepository.endpoint, login }
+  return accounts.find(a => isSameAccount(a, assigned)) ?? null
+}
+
+/**
+ * The account to publish with: the chosen account while it's still signed
+ * in, otherwise the only signed-in account. Returns null when the user has to
+ * choose between several accounts.
+ */
+function resolveSelectedAccount(
+  selectedAccount: Account | null,
+  accounts: ReadonlyArray<Account>
+): Account | null {
+  const selected = accounts.find(a => isSameAccount(a, selectedAccount))
+  if (selected !== undefined) {
+    return selected
+  }
+  return accounts.length === 1 ? accounts[0] : null
+}
+
+function getSettingsKind(account: Account | null) {
+  return account === null || isDotComAccount(account)
+    ? PublishSettingsType.dotcom
+    : PublishSettingsType.enterprise
+}
+
+/**
  * The Publish component.
  */
 export class Publish extends React.Component<IPublishProps, IPublishState> {
+  private mounted = false
+
   public constructor(props: IPublishProps) {
     super(props)
 
-    const dotComAccount = this.getAccountForTab(PublishTab.DotCom)
-    const enterpriseAccount = this.getAccountForTab(PublishTab.Enterprise)
-    let startingTab = PublishTab.DotCom
-    if (!dotComAccount && enterpriseAccount) {
-      startingTab = PublishTab.Enterprise
-    }
-
-    const publicationSettings = {
-      name: props.repository.name,
-      description: '',
-      private: true,
-    }
-
-    const dotcomTabState: IDotcomTabState = {
-      kind: 'dotcom',
-      settings: {
-        ...publicationSettings,
-        kind: PublishSettingsType.dotcom,
-        org: null,
-      },
-      error: null,
-    }
-
-    const enterpriseTabState: IEnterpriseTabState = {
-      kind: 'enterprise',
-      settings: {
-        ...publicationSettings,
-        kind: PublishSettingsType.enterprise,
-        org: null,
-      },
-      error: null,
-    }
+    const selectedAccount =
+      getAssignedAccount(props.repository, props.accounts) ??
+      resolveSelectedAccount(null, props.accounts)
 
     this.state = {
-      currentTab: startingTab,
-      dotcomTabState,
-      enterpriseTabState,
+      settings: {
+        kind: getSettingsKind(selectedAccount),
+        name: props.repository.name,
+        description: '',
+        private: true,
+        org: null,
+      },
+      error: null,
+      selectedAccount,
       publishing: false,
     }
   }
 
   public render() {
-    const currentTabState = this.getCurrentTabState()
-
     return (
       <Dialog
         id="publish-repository"
@@ -135,16 +126,8 @@ export class Publish extends React.Component<IPublishProps, IPublishState> {
         disabled={this.state.publishing}
         loading={this.state.publishing}
       >
-        <TabBar
-          onTabClicked={this.onTabClicked}
-          selectedIndex={this.state.currentTab}
-        >
-          <span>GitHub.com</span>
-          <span>GitHub Enterprise</span>
-        </TabBar>
-
-        {currentTabState.error ? (
-          <DialogError>{currentTabState.error.message}</DialogError>
+        {this.state.error ? (
+          <DialogError>{this.state.error.message}</DialogError>
         ) : null}
 
         {this.renderContent()}
@@ -154,140 +137,142 @@ export class Publish extends React.Component<IPublishProps, IPublishState> {
   }
 
   public async componentDidMount() {
-    const currentTabState = this.getCurrentTabState()
+    this.mounted = true
 
     try {
       const description = await getGitDescription(this.props.repository.path)
-      const settings = {
-        ...currentTabState.settings,
-        description,
+      if (this.mounted) {
+        this.setState(({ settings }) => ({
+          settings: { ...settings, description },
+        }))
       }
-
-      this.setCurrentTabSettings(settings)
     } catch (error) {
       log.warn(`Couldn't get the repository's description`, error)
     }
   }
 
-  private renderContent() {
-    const tab = this.state.currentTab
-    const currentTabState = this.getCurrentTabState()
-    const account = this.getAccountForTab(tab)
-    if (account) {
-      return (
-        <PublishRepository
-          account={account}
-          settings={currentTabState.settings}
-          onSettingsChanged={this.onSettingsChanged}
-        />
-      )
-    } else {
-      return <DialogContent>{this.renderSignInTab(tab)}</DialogContent>
+  public componentDidUpdate(
+    prevProps: IPublishProps,
+    prevState: IPublishState
+  ) {
+    const previous = resolveSelectedAccount(
+      prevState.selectedAccount,
+      prevProps.accounts
+    )
+    const current = this.getSelectedAccount()
+
+    // Organizations belong to an account, so start over when it changes.
+    const changed =
+      previous === null ? current !== null : !isSameAccount(previous, current)
+    if (changed) {
+      this.setState(({ settings }) => ({
+        settings: { ...settings, kind: getSettingsKind(current), org: null },
+      }))
     }
+  }
+
+  public componentWillUnmount() {
+    this.mounted = false
+  }
+
+  private getSelectedAccount() {
+    return resolveSelectedAccount(
+      this.state.selectedAccount,
+      this.props.accounts
+    )
+  }
+
+  private renderContent() {
+    if (this.props.accounts.length === 0) {
+      return <DialogContent>{this.renderSignIn()}</DialogContent>
+    }
+
+    return (
+      <PublishRepository
+        account={this.getSelectedAccount()}
+        accounts={this.props.accounts}
+        settings={this.state.settings}
+        onSettingsChanged={this.onSettingsChanged}
+        onSelectedAccountChanged={this.onSelectedAccountChanged}
+      />
+    )
+  }
+
+  private onSelectedAccountChanged = (account: Account) => {
+    this.setState({ selectedAccount: account })
   }
 
   private onSettingsChanged = (settings: RepositoryPublicationSettings) => {
-    let tabState: TabState
-    if (settings.kind === PublishSettingsType.enterprise) {
-      tabState = {
-        kind: 'enterprise',
-        settings: settings,
-        error: this.state.enterpriseTabState.error,
-      }
-    } else {
-      tabState = {
-        kind: 'dotcom',
-        settings: settings,
-        error: this.state.dotcomTabState.error,
-      }
-    }
-
-    this.setTabState(tabState)
+    this.setState({ settings })
   }
 
-  private getAccountForTab(tab: PublishTab): Account | null {
-    const accounts = this.props.accounts
-    switch (tab) {
-      case PublishTab.DotCom:
-        return accounts.find(a => a.endpoint === getDotComAPIEndpoint()) || null
-      case PublishTab.Enterprise:
-        return accounts.find(a => a.endpoint !== getDotComAPIEndpoint()) || null
-      default:
-        return assertNever(tab, `Unknown tab: ${tab}`)
-    }
-  }
-
-  private renderSignInTab(tab: PublishTab) {
+  private renderSignIn() {
     const signInTitle = __DARWIN__ ? 'Sign In' : 'Sign in'
-    switch (tab) {
-      case PublishTab.DotCom:
-        return (
-          <CallToAction actionTitle={signInTitle} onAction={this.signInDotCom}>
-            <div>
-              Sign in to your GitHub.com account to access your repositories.
-            </div>
-          </CallToAction>
-        )
-      case PublishTab.Enterprise:
-        return (
-          <CallToAction
-            actionTitle={signInTitle}
-            onAction={this.signInEnterprise}
-          >
-            <div>
-              If you have a GitHub Enterprise or AE account at work, sign in to
-              it to get access to your repositories.
-            </div>
-          </CallToAction>
-        )
-      default:
-        return assertNever(tab, `Unknown tab: ${tab}`)
-    }
+    return (
+      <>
+        <CallToAction actionTitle={signInTitle} onAction={this.signInDotCom}>
+          <div>
+            Sign in to your GitHub.com account to publish your repository.
+          </div>
+        </CallToAction>
+        <Row className="sign-in-enterprise">
+          <LinkButton onClick={this.signInEnterprise}>
+            {__DARWIN__
+              ? 'Sign In to GitHub Enterprise'
+              : 'Sign in to GitHub Enterprise'}
+          </LinkButton>
+        </Row>
+      </>
+    )
   }
 
   private renderFooter() {
-    const currentTabState = this.getCurrentTabState()
-    const disabled = !currentTabState.settings.name.length
-    const tab = this.state.currentTab
-    const user = this.getAccountForTab(tab)
-    if (user) {
-      return (
-        <DialogFooter>
-          <OkCancelButtonGroup
-            okButtonText={
-              __DARWIN__ ? 'Publish Repository' : 'Publish repository'
-            }
-            okButtonDisabled={disabled}
-          />
-        </DialogFooter>
-      )
-    } else {
+    if (this.props.accounts.length === 0) {
       return null
+    }
+
+    const disabled =
+      !this.state.settings.name.length || this.getSelectedAccount() === null
+
+    return (
+      <DialogFooter>
+        <OkCancelButtonGroup
+          okButtonText={
+            __DARWIN__ ? 'Publish Repository' : 'Publish repository'
+          }
+          okButtonDisabled={disabled}
+        />
+      </DialogFooter>
+    )
+  }
+
+  /** Select the account the user signed in to from this dialog. */
+  private onSignInResult = (result: SignInResult) => {
+    if (result.kind === 'success' && this.mounted) {
+      this.setState({ selectedAccount: result.account })
     }
   }
 
   private signInDotCom = () => {
-    this.props.dispatcher.showDotComSignInDialog()
+    this.props.dispatcher.showDotComSignInDialog(this.onSignInResult)
   }
 
   private signInEnterprise = () => {
-    this.props.dispatcher.showEnterpriseSignInDialog()
+    this.props.dispatcher.showEnterpriseSignInDialog(
+      undefined,
+      this.onSignInResult
+    )
   }
 
   private publishRepository = async () => {
-    const currentTabState = this.getCurrentTabState()
-
-    this.setCurrentTabError(null)
-    this.setState({ publishing: true })
-
-    const tab = this.state.currentTab
-    const account = this.getAccountForTab(tab)
-    if (!account) {
-      fatalError(`Tried to publish with no user. That seems impossible!`)
+    const account = this.getSelectedAccount()
+    if (account === null) {
+      return
     }
 
-    const settings = currentTabState.settings
-    const { org } = currentTabState.settings
+    this.setState({ error: null, publishing: true })
+
+    const { settings } = this.state
 
     try {
       await this.props.dispatcher.publishRepository(
@@ -296,56 +281,12 @@ export class Publish extends React.Component<IPublishProps, IPublishState> {
         settings.description,
         settings.private,
         account,
-        org
+        settings.org
       )
 
       this.props.onDismissed()
     } catch (e) {
-      this.setCurrentTabError(e)
-      this.setState({ publishing: false })
+      this.setState({ error: e, publishing: false })
     }
-  }
-
-  private onTabClicked = (index: PublishTab) => {
-    const isTabChanging = index !== this.state.currentTab
-    if (isTabChanging) {
-      this.setState({ currentTab: index })
-    }
-  }
-
-  private getCurrentTabState = () =>
-    this.state.currentTab === PublishTab.DotCom
-      ? this.state.dotcomTabState
-      : this.state.enterpriseTabState
-
-  private setTabState = (state: TabState) => {
-    if (state.kind === 'enterprise') {
-      this.setState({ enterpriseTabState: state })
-    } else {
-      this.setState({ dotcomTabState: state })
-    }
-  }
-
-  private setCurrentTabSettings = (settings: RepositoryPublicationSettings) => {
-    if (settings.kind === PublishSettingsType.enterprise) {
-      const enterpriseTabState = {
-        ...this.state.enterpriseTabState,
-        settings: settings,
-      }
-      this.setTabState(enterpriseTabState)
-    } else {
-      const dotcomTabState = {
-        ...this.state.dotcomTabState,
-        settings: settings,
-      }
-      this.setTabState(dotcomTabState)
-    }
-  }
-
-  private setCurrentTabError = (error: Error | null) => {
-    this.setTabState({
-      ...this.getCurrentTabState(),
-      error: error,
-    })
   }
 }

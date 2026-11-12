@@ -5,6 +5,7 @@ import { Repository } from '../../models/repository'
 import { Branch } from '../../models/branch'
 import { Dispatcher } from '../dispatcher'
 import { Button } from '../lib/button'
+import { formatNumber } from '../../lib/format-number'
 
 interface IMergeCallToActionProps {
   readonly repository: Repository
@@ -52,7 +53,7 @@ export class MergeCallToAction extends React.Component<
       return (
         <div className="merge-message merge-message-legacy">
           This will merge
-          <strong>{` ${count} ${pluralized}`}</strong>
+          <strong>{` ${formatNumber(count)} ${pluralized}`}</strong>
           {` `}
           from
           {` `}
@@ -71,11 +72,11 @@ export class MergeCallToAction extends React.Component<
   private onMergeClicked = async () => {
     const formState = this.props.formState
 
-    this.props.dispatcher.recordCompareInitiatedMerge()
+    this.props.dispatcher.incrementMetric('mergesInitiatedFromComparison')
 
     await this.props.dispatcher.mergeBranch(
       this.props.repository,
-      formState.comparisonBranch.name,
+      formState.comparisonBranch,
       null
     )
 

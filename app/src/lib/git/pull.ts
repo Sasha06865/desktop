@@ -1,42 +1,17 @@
 import {
   git,
-  GitError,
-  IGitExecutionOptions,
-  gitNetworkArguments,
   gitRebaseArguments,
+  HookProgress,
+  IGitStringExecutionOptions,
+  TerminalOutput,
+  TerminalOutputCallback,
 } from './core'
 import { Repository } from '../../models/repository'
 import { IPullProgress } from '../../models/progress'
-import { IGitAccount } from '../../models/git-account'
 import { PullProgressParser, executionOptionsWithProgress } from '../progress'
-import { AuthenticationErrors } from './authentication'
-import { enableRecurseSubmodulesFlag } from '../feature-flag'
 import { IRemote } from '../../models/remote'
-import { merge } from '../merge'
-import { withTrampolineEnvForRemoteOperation } from '../trampoline/trampoline-environment'
-
-async function getPullArgs(
-  repository: Repository,
-  remote: string,
-  account: IGitAccount | null,
-  progressCallback?: (progress: IPullProgress) => void
-) {
-  const networkArguments = await gitNetworkArguments(repository, account)
-
-  const args = [...networkArguments, ...gitRebaseArguments(), 'pull']
-
-  if (enableRecurseSubmodulesFlag()) {
-    args.push('--recurse-submodules')
-  }
-
-  if (progressCallback != null) {
-    args.push('--progress')
-  }
-
-  args.push(remote)
-
-  return args
-}
+import { envForRemoteOperation } from './environment'
+import { getConfigValue } from './config'
 
 /**
  * Pull from the specified remote.
@@ -53,15 +28,42 @@ async function getPullArgs(
  */
 export async function pull(
   repository: Repository,
-  account: IGitAccount | null,
   remote: IRemote,
-  progressCallback?: (progress: IPullProgress) => void
+  options?: {
+    progressCallback?: (progress: IPullProgress) => void
+    onHookProgress?: (progress: HookProgress) => void
+    onHookFailure?: (
+      hookName: string,
+      terminalOutput: TerminalOutput
+    ) => Promise<'abort' | 'ignore'>
+    onTerminalOutputAvailable?: TerminalOutputCallback
+    noVerify?: boolean
+  }
 ): Promise<void> {
-  let opts: IGitExecutionOptions = {
-    expectedErrors: AuthenticationErrors,
+  // Git pull forwards the remote name to its child git fetch without a `--`
+  // separator. Reject leading dashes here even though direct fetch and push
+  // can handle them with a separator.
+  if (remote.name.startsWith('-')) {
+    throw new Error("Cannot pull from a remote whose name starts with '-'.")
   }
 
-  if (progressCallback) {
+  let opts: IGitStringExecutionOptions = {
+    env: await envForRemoteOperation(remote.url),
+    // git pull triggers merge or rebase hooks depending on config, instead of
+    // trying to check pull.rebase and friends we'll just intercept all possible
+    // hooks that could be run as part of a pull operation.
+    interceptHooks: [
+      'pre-merge-commit',
+      'prepare-commit-msg',
+      'commit-msg',
+      'post-merge',
+      'pre-rebase',
+      'pre-commit',
+      'post-rewrite',
+    ],
+  }
+
+  if (options?.progressCallback) {
     const title = `Pulling ${remote.name}`
     const kind = 'pull'
 
@@ -84,7 +86,7 @@ export async function pull(
 
         const value = progress.percent
 
-        progressCallback({
+        options?.progressCallback?.({
           kind,
           title,
           description,
@@ -95,27 +97,42 @@ export async function pull(
     )
 
     // Initial progress
-    progressCallback({ kind, title, value: 0, remote: remote.name })
+    options.progressCallback({ kind, title, value: 0, remote: remote.name })
   }
 
-  const args = await getPullArgs(
-    repository,
+  const args = [
+    ...gitRebaseArguments(),
+    'pull',
+    ...(await getDefaultPullDivergentBranchArguments(repository)),
+    '--recurse-submodules',
+    ...(options?.progressCallback ? ['--progress'] : []),
+    ...(options?.noVerify ? ['--no-verify'] : []),
+    '--',
     remote.name,
-    account,
-    progressCallback
-  )
-  const result = await withTrampolineEnvForRemoteOperation(
-    account,
-    remote.url,
-    env => {
-      return git(args, repository.path, 'pull', {
-        ...opts,
-        env: merge(opts.env, env),
-      })
-    }
-  )
+  ]
 
-  if (result.gitErrorDescription) {
-    throw new GitError(result, args)
+  await git(args, repository.path, 'pull', opts)
+}
+
+/**
+ * Defaults the pull default for divergent paths to try to fast forward and if
+ * not perform a merge. Aka uses the flag --ff
+ *
+ * It checks whether the user has a config set for this already, if so, no need for
+ * default.
+ */
+async function getDefaultPullDivergentBranchArguments(
+  repository: Repository
+): Promise<ReadonlyArray<string>> {
+  try {
+    const pullFF = await getConfigValue(repository, 'pull.ff')
+    return pullFF !== null ? [] : ['--ff']
+  } catch (e) {
+    log.error("Couldn't read 'pull.ff' config", e)
   }
+
+  // If there is a failure in checking the config, we still want to use any
+  // config and not overwrite the user's set config behavior. This will show the
+  // git error if no config is set.
+  return []
 }

@@ -4,6 +4,10 @@ import classNames from 'classnames'
 import { assertNever } from '../../lib/fatal-error'
 import { Button } from '../lib/button'
 import { clamp } from '../../lib/clamp'
+import { createObservableRef } from '../lib/observable-ref'
+import { Tooltip, TooltipDirection, TooltipTarget } from '../lib/tooltip'
+import { AriaHasPopupType } from '../lib/aria-types'
+import { enableResizingToolbarButtons } from '../../lib/feature-flag'
 
 /** The button style. */
 export enum ToolbarButtonStyle {
@@ -37,16 +41,17 @@ export interface IToolbarButtonProps {
   readonly onClick?: (event: React.MouseEvent<HTMLButtonElement>) => void
 
   /**
+   * An optional event handler for when the button's context menu
+   * is activated by a pointer event or by hitting the menu key
+   * while focused.
+   */
+  readonly onContextMenu?: (event: React.MouseEvent<HTMLButtonElement>) => void
+
+  /**
    * A function that's called when the user hovers over the button with
    * a pointer device.
    */
   readonly onMouseEnter?: (event: React.MouseEvent<HTMLButtonElement>) => void
-
-  /**
-   * A function that's called when a key event is received from the
-   * ToolbarButton component or any of its descendants.
-   */
-  readonly onKeyDown?: (event: React.KeyboardEvent<HTMLDivElement>) => void
 
   /**
    * An optional classname that will be appended to the default
@@ -98,12 +103,43 @@ export interface IToolbarButtonProps {
 
   readonly role?: string
   readonly ariaExpanded?: boolean
+  readonly ariaHaspopup?: AriaHasPopupType
+
+  /**
+   * Typically the contents of a button serve the purpose of describing the
+   * buttons use. However, ariaLabel can be used if the contents do not suffice.
+   * Such as when a button wraps an image and there is no text.
+   */
+  readonly ariaLabel?: string
+
+  /**
+   * Whether to only show the tooltip when the tooltip target overflows its
+   * bounds. Typically this is used in conjunction with an ellipsis CSS ruleset.
+   */
+  readonly onlyShowTooltipWhenOverflowed?: boolean
+
+  /**
+   * Optional, custom overrided of the Tooltip components internal logic for
+   * determining whether the tooltip target is overflowed or not.
+   *
+   * The internal overflow logic is simple and relies on the target itself
+   * having the `text-overflow` CSS rule applied to it. In some scenarios
+   * consumers may have a deep child element which is the one that should be
+   * tested for overflow while still having the parent element be the pointer
+   * device hit area.
+   *
+   * Consumers may pass a boolean if the overflowed state is known at render
+   * time or they may pass a function which gets executed just before showing
+   * the tooltip.
+   */
+  readonly isOverflowed?: ((target: TooltipTarget) => boolean) | boolean
 }
 
 /**
  * A general purpose toolbar button
  */
 export class ToolbarButton extends React.Component<IToolbarButtonProps, {}> {
+  public wrapperRef = createObservableRef<HTMLDivElement>()
   public innerButton: Button | null = null
 
   private onClick = (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -136,6 +172,7 @@ export class ToolbarButton extends React.Component<IToolbarButtonProps, {}> {
   }
 
   public render() {
+    const { tooltip } = this.props
     const icon = this.props.icon ? (
       <Octicon
         symbol={this.props.icon}
@@ -146,6 +183,7 @@ export class ToolbarButton extends React.Component<IToolbarButtonProps, {}> {
     const className = classNames(
       'toolbar-button',
       { 'has-progress': this.props.progressValue !== undefined },
+      { resizable: enableResizingToolbarButtons() },
       this.props.className
     )
 
@@ -163,19 +201,28 @@ export class ToolbarButton extends React.Component<IToolbarButtonProps, {}> {
       ) : undefined
 
     return (
-      <div
-        className={className}
-        onKeyDown={this.props.onKeyDown}
-        title={this.props.tooltip}
-      >
+      <div className={className} ref={this.wrapperRef}>
+        {tooltip && (
+          <Tooltip
+            target={this.wrapperRef}
+            direction={TooltipDirection.SOUTH}
+            onlyWhenOverflowed={this.props.onlyShowTooltipWhenOverflowed}
+            isTargetOverflowed={this.props.isOverflowed}
+          >
+            {tooltip}
+          </Tooltip>
+        )}
         <Button
           onClick={this.onClick}
+          onContextMenu={this.props.onContextMenu}
           ref={this.onButtonRef}
           disabled={this.props.disabled}
           onMouseEnter={this.props.onMouseEnter}
           tabIndex={this.props.tabIndex}
           role={this.props.role}
           ariaExpanded={this.props.ariaExpanded}
+          ariaHaspopup={this.props.ariaHaspopup}
+          ariaLabel={this.props.ariaLabel}
         >
           {progress}
           {icon}

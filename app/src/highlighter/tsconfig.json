@@ -1,8 +1,9 @@
 {
   "compilerOptions": {
     "module": "esnext",
-    "moduleResolution": "node",
-    "target": "es2017",
+    "moduleResolution": "bundler",
+    "rootDir": "..",
+    "target": "ES2021",
     "allowUnreachableCode": false,
     "allowUnusedLabels": false,
     "noImplicitReturns": true,
@@ -11,7 +12,7 @@
     "sourceMap": true,
     "strict": true,
     "outDir": "../../../out",
-    "lib": ["scripthost", "webworker", "es2017"],
+    "lib": ["scripthost", "webworker", "es2021"],
     "types": []
   },
   "compileOnSave": false

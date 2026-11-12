@@ -1,11 +1,19 @@
 import { spawn, ChildProcess } from 'child_process'
-import { pathExists } from 'fs-extra'
 import { assertNever } from '../fatal-error'
-import { IFoundShell } from './found-shell'
 import { parseEnumValue } from '../enum'
+import { pathExists } from '../path-exists'
+import { FoundShell } from './shared'
+import {
+  expandTargetPathArgument,
+  ICustomIntegration,
+  parseCustomIntegrationArguments,
+  spawnCustomIntegration,
+} from '../custom-integration'
 
 export enum Shell {
   Gnome = 'GNOME Terminal',
+  GnomeConsole = 'GNOME Console',
+  Ptyxis = 'Ptyxis',
   Mate = 'MATE Terminal',
   Tilix = 'Tilix',
   Terminator = 'Terminator',
@@ -13,6 +21,14 @@ export enum Shell {
   Konsole = 'Konsole',
   Xterm = 'XTerm',
   Terminology = 'Terminology',
+  Deepin = 'Deepin Terminal',
+  Elementary = 'Elementary Terminal',
+  XFCE = 'XFCE Terminal',
+  Alacritty = 'Alacritty',
+  Kitty = 'Kitty',
+  LXTerminal = 'LXDE Terminal',
+  Warp = 'Warp',
+  Ghostty = 'Ghostty',
 }
 
 export const Default = Shell.Gnome
@@ -29,6 +45,10 @@ function getShellPath(shell: Shell): Promise<string | null> {
   switch (shell) {
     case Shell.Gnome:
       return getPathIfAvailable('/usr/bin/gnome-terminal')
+    case Shell.GnomeConsole:
+      return getPathIfAvailable('/usr/bin/kgx')
+    case Shell.Ptyxis:
+      return getPathIfAvailable('/usr/bin/ptyxis')
     case Shell.Mate:
       return getPathIfAvailable('/usr/bin/mate-terminal')
     case Shell.Tilix:
@@ -43,16 +63,34 @@ function getShellPath(shell: Shell): Promise<string | null> {
       return getPathIfAvailable('/usr/bin/xterm')
     case Shell.Terminology:
       return getPathIfAvailable('/usr/bin/terminology')
+    case Shell.Deepin:
+      return getPathIfAvailable('/usr/bin/deepin-terminal')
+    case Shell.Elementary:
+      return getPathIfAvailable('/usr/bin/io.elementary.terminal')
+    case Shell.XFCE:
+      return getPathIfAvailable('/usr/bin/xfce4-terminal')
+    case Shell.Alacritty:
+      return getPathIfAvailable('/usr/bin/alacritty')
+    case Shell.Kitty:
+      return getPathIfAvailable('/usr/bin/kitty')
+    case Shell.LXTerminal:
+      return getPathIfAvailable('/usr/bin/lxterminal')
+    case Shell.Warp:
+      return getPathIfAvailable('/usr/bin/warp-terminal')
+    case Shell.Ghostty:
+      return getPathIfAvailable('/usr/bin/ghostty')
     default:
       return assertNever(shell, `Unknown shell: ${shell}`)
   }
 }
 
 export async function getAvailableShells(): Promise<
-  ReadonlyArray<IFoundShell<Shell>>
+  ReadonlyArray<FoundShell<Shell>>
 > {
   const [
     gnomeTerminalPath,
+    gnomeConsolePath,
+    ptyxisPath,
     mateTerminalPath,
     tilixPath,
     terminatorPath,
@@ -60,8 +98,18 @@ export async function getAvailableShells(): Promise<
     konsolePath,
     xtermPath,
     terminologyPath,
+    deepinPath,
+    elementaryPath,
+    xfcePath,
+    alacrittyPath,
+    kittyPath,
+    lxterminalPath,
+    warpPath,
+    ghosttyPath,
   ] = await Promise.all([
     getShellPath(Shell.Gnome),
+    getShellPath(Shell.GnomeConsole),
+    getShellPath(Shell.Ptyxis),
     getShellPath(Shell.Mate),
     getShellPath(Shell.Tilix),
     getShellPath(Shell.Terminator),
@@ -69,11 +117,27 @@ export async function getAvailableShells(): Promise<
     getShellPath(Shell.Konsole),
     getShellPath(Shell.Xterm),
     getShellPath(Shell.Terminology),
+    getShellPath(Shell.Deepin),
+    getShellPath(Shell.Elementary),
+    getShellPath(Shell.XFCE),
+    getShellPath(Shell.Alacritty),
+    getShellPath(Shell.Kitty),
+    getShellPath(Shell.LXTerminal),
+    getShellPath(Shell.Warp),
+    getShellPath(Shell.Ghostty),
   ])
 
-  const shells: Array<IFoundShell<Shell>> = []
+  const shells: Array<FoundShell<Shell>> = []
   if (gnomeTerminalPath) {
     shells.push({ shell: Shell.Gnome, path: gnomeTerminalPath })
+  }
+
+  if (gnomeConsolePath) {
+    shells.push({ shell: Shell.GnomeConsole, path: gnomeConsolePath })
+  }
+
+  if (ptyxisPath) {
+    shells.push({ shell: Shell.Ptyxis, path: ptyxisPath })
   }
 
   if (mateTerminalPath) {
@@ -104,20 +168,61 @@ export async function getAvailableShells(): Promise<
     shells.push({ shell: Shell.Terminology, path: terminologyPath })
   }
 
+  if (deepinPath) {
+    shells.push({ shell: Shell.Deepin, path: deepinPath })
+  }
+
+  if (elementaryPath) {
+    shells.push({ shell: Shell.Elementary, path: elementaryPath })
+  }
+
+  if (xfcePath) {
+    shells.push({ shell: Shell.XFCE, path: xfcePath })
+  }
+
+  if (alacrittyPath) {
+    shells.push({ shell: Shell.Alacritty, path: alacrittyPath })
+  }
+
+  if (kittyPath) {
+    shells.push({ shell: Shell.Kitty, path: kittyPath })
+  }
+
+  if (lxterminalPath) {
+    shells.push({ shell: Shell.LXTerminal, path: lxterminalPath })
+  }
+
+  if (warpPath) {
+    shells.push({ shell: Shell.Warp, path: warpPath })
+  }
+
+  if (ghosttyPath) {
+    shells.push({ shell: Shell.Ghostty, path: ghosttyPath })
+  }
+
   return shells
 }
 
 export function launch(
-  foundShell: IFoundShell<Shell>,
+  foundShell: FoundShell<Shell>,
   path: string
 ): ChildProcess {
   const shell = foundShell.shell
   switch (shell) {
     case Shell.Gnome:
+    case Shell.GnomeConsole:
     case Shell.Mate:
     case Shell.Tilix:
     case Shell.Terminator:
+    case Shell.XFCE:
+    case Shell.Alacritty:
       return spawn(foundShell.path, ['--working-directory', path])
+    case Shell.Ptyxis:
+      return spawn(foundShell.path, [
+        '--new-window',
+        '--working-directory',
+        path,
+      ])
     case Shell.Urxvt:
       return spawn(foundShell.path, ['-cd', path])
     case Shell.Konsole:
@@ -126,7 +231,27 @@ export function launch(
       return spawn(foundShell.path, ['-e', '/bin/bash'], { cwd: path })
     case Shell.Terminology:
       return spawn(foundShell.path, ['-d', path])
+    case Shell.Deepin:
+      return spawn(foundShell.path, ['-w', path])
+    case Shell.Elementary:
+      return spawn(foundShell.path, ['-w', path])
+    case Shell.Kitty:
+      return spawn(foundShell.path, ['--single-instance', '--directory', path])
+    case Shell.LXTerminal:
+    case Shell.Ghostty:
+      return spawn(foundShell.path, ['--working-directory=' + path])
+    case Shell.Warp:
+      return spawn(foundShell.path, [], { cwd: path })
     default:
       return assertNever(shell, `Unknown shell: ${shell}`)
   }
+}
+
+export function launchCustomShell(
+  customShell: ICustomIntegration,
+  path: string
+): ChildProcess {
+  const argv = parseCustomIntegrationArguments(customShell.arguments)
+  const args = expandTargetPathArgument(argv, path)
+  return spawnCustomIntegration(customShell.path, args)
 }

@@ -1,11 +1,11 @@
-import { writeFile } from 'fs-extra'
+import { writeFile } from 'fs/promises'
 import * as Path from 'path'
 
 const DefaultReadmeName = 'README.md'
 
 function defaultReadmeContents(name: string, description?: string): string {
   return description !== undefined
-    ? `# ${name}\n ${description}\n`
+    ? `# ${name}\n${description}\n`
     : `# ${name}\n`
 }
 

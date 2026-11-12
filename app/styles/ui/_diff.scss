@@ -4,6 +4,7 @@
 .diff-code-mirror {
   flex-grow: 1;
   min-width: 0;
+  overflow-y: auto;
 }
 
 .diff-code-mirror .CodeMirror {
@@ -101,6 +102,10 @@
       display: inline-block;
     }
   }
+
+  .popover-component.whitespace-hint {
+    width: 225px;
+  }
 }
 
 // The container element which holds the before and after
@@ -125,31 +130,37 @@
     top: 0;
   }
 
-  .hunk-expand-up-handle {
-    position: absolute;
-    height: 50%;
-    width: 100%;
-    right: 0;
-    bottom: 0;
-    text-align: center;
-  }
+  .hunk-expander {
+    overflow: inherit;
+    text-overflow: inherit;
+    white-space: inherit;
+    font-family: inherit;
+    font-size: inherit;
+    padding: inherit;
+    border: none;
+    height: inherit;
+    color: inherit;
+    background-color: inherit;
 
-  .hunk-expand-down-handle {
     position: absolute;
-    height: 50%;
-    width: 100%;
     right: 0;
-    top: 0;
+    width: 100%;
     text-align: center;
-  }
 
-  .hunk-expand-whole-handle {
-    position: absolute;
-    height: 100%;
-    width: 100%;
-    right: 0;
-    bottom: 0;
-    text-align: center;
+    &.hunk-expand-up-handle {
+      height: 50%;
+      bottom: 0;
+    }
+
+    &.hunk-expand-down-handle {
+      height: 50%;
+      top: 0;
+    }
+
+    &.hunk-expand-whole-handle {
+      height: 100%;
+      bottom: 0;
+    }
   }
 
   &:not(.includeable) {
@@ -551,6 +562,9 @@
 
     .image-container {
       position: relative;
+      // Fix for issue #21392: Force GPU compositing to ensure both
+      // image layers are rasterized consistently for mix-blend-mode
+      transform: translate3d(0, 0, 0);
 
       .image-diff-previous,
       .image-diff-current {
@@ -672,6 +686,10 @@
     color: inherit;
   }
 
+  .cm-quote {
+    color: var(--syntax-quote-color);
+  }
+
   .cm-variable-2,
   .cm-variable-3 {
     color: var(--syntax-alt-variable-color);
@@ -717,6 +735,12 @@
     color: var(--syntax-header-color);
   }
 
+  .cm-m-cmake {
+    &.cm-def {
+      color: var(--syntax-atom-color);
+    }
+  }
+
   .cm-m-css {
     &.cm-property {
       color: var(--syntax-atom-color);
@@ -735,6 +759,12 @@
     }
   }
 
+  .cm-m-toml {
+    &.cm-string.cm-property {
+      color: var(--syntax-string-color);
+    }
+  }
+
   // Intra line markings takes precedence over syntax highlighting.
   .cm-diff-delete-inner {
     color: var(--diff-delete-text-color) !important;
@@ -747,10 +777,43 @@
 
 .seamless-diff-switcher {
   display: flex;
+  flex-direction: column;
   flex-grow: 1;
   min-width: 0;
   overflow: hidden;
   position: relative;
+
+  .panel {
+    padding-top: var(--spacing);
+
+    display: flex;
+    flex: 1;
+
+    &.empty,
+    &.renamed,
+    &.binary {
+      justify-content: center;
+      align-items: center;
+    }
+    &.large-diff {
+      margin: var(--spacing-double);
+      text-align: center;
+      justify-content: initial;
+
+      .blankslate-image {
+        max-height: 150px;
+      }
+
+      .description {
+        margin-top: var(--spacing);
+        margin-bottom: var(--spacing);
+
+        p {
+          margin: 0;
+        }
+      }
+    }
+  }
 
   .loading-indicator {
     position: absolute;
@@ -759,6 +822,29 @@
     display: none;
     opacity: 0;
     pointer-events: none;
+  }
+
+  .diff-contents-warning-container {
+    background-color: var(--file-warning-background-color);
+    padding: var(--spacing) var(--spacing-double);
+    border-bottom: var(--file-warning-border-color) solid 1px;
+
+    .octicon {
+      margin-right: var(--spacing);
+      color: var(--file-warning-color);
+      vertical-align: text-bottom;
+    }
+
+    a.link-button-component {
+      display: unset;
+    }
+
+    // Separate warning items
+    .diff-contents-warning:not(:last-child) {
+      margin-bottom: var(--spacing);
+      border-bottom: var(--file-warning-border-color) solid 1px;
+      padding-bottom: var(--spacing);
+    }
   }
 
   // When loading a diff
@@ -796,6 +882,64 @@
       & > :not(.loading-indicator) {
         opacity: 0.2;
       }
+    }
+  }
+
+  // When focus moves to the virtualized grid, we want to show a focus ring.
+  &:has(.ReactVirtualized__Grid:focus-visible) {
+    outline: 2px solid var(--focus-color);
+    border-radius: var(--border-radius);
+
+    // Move the content over to make room for the focus ring
+    margin-right: 2px;
+    margin-bottom: 2px;
+  }
+}
+
+.diff-container {
+  display: flex;
+  flex-direction: column;
+  flex-grow: 1;
+  min-width: 0;
+  max-height: 100%;
+
+  .header {
+    span {
+      user-select: text;
+    }
+
+    background: var(--box-alt-background-color);
+    border-bottom: 1px solid var(--diff-border-color);
+
+    display: flex;
+    flex-direction: row;
+    flex-shrink: 0;
+    flex-grow: 0;
+    align-items: center;
+
+    padding: var(--spacing-half) var(--spacing);
+
+    @include octicon-status;
+
+    .diff-options-component {
+      margin-right: var(--spacing-half);
+      flex-shrink: 0;
+    }
+
+    .octicon.status {
+      flex-shrink: 0;
+      vertical-align: text-bottom;
+      position: relative;
+      align-self: center;
+      flex-shrink: 0;
+    }
+
+    .line-endings {
+      margin-right: var(--spacing-half);
+    }
+
+    .open-merge-tool {
+      margin-right: var(--spacing-half);
     }
   }
 }

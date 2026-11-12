@@ -1,14 +1,9 @@
-import * as FSE from 'fs-extra'
-import * as Path from 'path'
-
-import { git } from './core'
+import { join } from 'path'
+import { git, HookCallbackOptions } from './core'
 import { GitError } from 'dugite'
 import { Repository } from '../../models/repository'
-import { Branch } from '../../models/branch'
-import { MergeTreeResult } from '../../models/merge'
-import { ComputedAction } from '../../models/computed-action'
-import { parseMergeTreeResult } from '../merge-tree-parser'
-import { spawnAndComplete } from './spawn'
+import { pathExists } from '../path-exists'
+import { createMultiOperationTerminalOutputCallback } from './multi-operation-terminal-output'
 
 export enum MergeResult {
   /** The merge completed successfully */
@@ -24,22 +19,70 @@ export enum MergeResult {
   Failed,
 }
 
+export type MergeOptions = {
+  /** Whether to perform a squash merge */
+  readonly squash?: boolean
+  /** Whether to bypass pre-merge and post-merge hooks */
+  readonly noVerify?: boolean
+} & HookCallbackOptions
+
 /** Merge the named branch into the current branch. */
 export async function merge(
   repository: Repository,
-  branch: string
+  branch: string,
+  options?: MergeOptions
 ): Promise<MergeResult> {
-  const { exitCode, stdout } = await git(
-    ['merge', branch],
-    repository.path,
-    'merge',
-    {
-      expectedErrors: new Set([GitError.MergeConflicts]),
-    }
-  )
+  const onTerminalOutputAvailable = options?.onTerminalOutputAvailable
+    ? createMultiOperationTerminalOutputCallback(
+        options?.onTerminalOutputAvailable
+      )
+    : undefined
+
+  const args = ['merge']
+
+  if (options?.squash) {
+    args.push('--squash')
+  }
+
+  if (options?.noVerify) {
+    args.push('--no-verify')
+  }
+
+  args.push('--', branch)
+
+  const { exitCode, stdout } = await git(args, repository.path, 'merge', {
+    expectedErrors: new Set([GitError.MergeConflicts]),
+    interceptHooks: ['pre-merge-commit', 'post-merge', 'commit-msg'],
+    onHookProgress: options?.onHookProgress,
+    onHookFailure: options?.onHookFailure,
+    onTerminalOutputAvailable,
+  })
 
   if (exitCode !== 0) {
     return MergeResult.Failed
+  }
+
+  if (options?.squash) {
+    const { exitCode } = await git(
+      ['commit', '--no-edit'],
+      repository.path,
+      'createSquashMergeCommit',
+      {
+        interceptHooks: [
+          'pre-merge-commit',
+          'prepare-commit-msg',
+          'commit-msg',
+          'post-commit',
+          'pre-auto-gc',
+        ],
+        onHookProgress: options?.onHookProgress,
+        onHookFailure: options?.onHookFailure,
+        onTerminalOutputAvailable,
+      }
+    )
+    if (exitCode !== 0) {
+      return MergeResult.Failed
+    }
   }
 
   return stdout === noopMergeMessage
@@ -61,7 +104,7 @@ export async function getMergeBase(
   secondCommitish: string
 ): Promise<string | null> {
   const process = await git(
-    ['merge-base', firstCommitish, secondCommitish],
+    ['merge-base', '--', firstCommitish, secondCommitish],
     repository.path,
     'merge-base',
     {
@@ -80,44 +123,6 @@ export async function getMergeBase(
 }
 
 /**
- * Generate the merge result from two branches in a repository
- *
- * @param repository The repository containing the branches to merge
- * @param ours The current branch
- * @param theirs Another branch to merge into the current branch
- */
-export async function mergeTree(
-  repository: Repository,
-  ours: Branch,
-  theirs: Branch
-): Promise<MergeTreeResult | null> {
-  const mergeBase = await getMergeBase(repository, ours.tip.sha, theirs.tip.sha)
-
-  if (mergeBase === null) {
-    return { kind: ComputedAction.Invalid }
-  }
-
-  if (mergeBase === ours.tip.sha || mergeBase === theirs.tip.sha) {
-    return { kind: ComputedAction.Clean, entries: [] }
-  }
-
-  const result = await spawnAndComplete(
-    ['merge-tree', mergeBase, ours.tip.sha, theirs.tip.sha],
-    repository.path,
-    'mergeTree'
-  )
-
-  const output = result.output.toString()
-
-  if (output.length === 0) {
-    // the merge commit will be empty - this is fine!
-    return { kind: ComputedAction.Clean, entries: [] }
-  }
-
-  return parseMergeTreeResult(output)
-}
-
-/**
  * Abort a mid-flight (conflicted) merge
  *
  * @param repository where to abort the merge
@@ -131,6 +136,19 @@ export async function abortMerge(repository: Repository): Promise<void> {
  * that it is in a conflicted state.
  */
 export async function isMergeHeadSet(repository: Repository): Promise<boolean> {
-  const path = Path.join(repository.path, '.git', 'MERGE_HEAD')
-  return FSE.pathExists(path)
+  const path = join(repository.resolvedGitDir, 'MERGE_HEAD')
+  return await pathExists(path)
+}
+
+/**
+ * Check the `.git/SQUASH_MSG` file exists in a repository
+ * This would indicate we did a merge --squash and have not committed.. indicating
+ * we have detected a conflict.
+ *
+ * Note: If we abort the merge, this doesn't get cleared automatically which
+ * could lead to this being erroneously available in a non merge --squashing scenario.
+ */
+export async function isSquashMsgSet(repository: Repository): Promise<boolean> {
+  const path = join(repository.resolvedGitDir, 'SQUASH_MSG')
+  return await pathExists(path)
 }

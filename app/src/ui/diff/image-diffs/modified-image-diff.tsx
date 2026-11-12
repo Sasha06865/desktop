@@ -69,8 +69,8 @@ export class ModifiedImageDiff extends React.Component<
     super(props)
 
     this.resizeObserver = new ResizeObserver(entries => {
-      for (const entry of entries) {
-        if (entry.target === this.container) {
+      for (const { target, contentRect } of entries) {
+        if (target === this.container && target instanceof HTMLElement) {
           // We might end up causing a recursive update by updating the state
           // when we're reacting to a resize so we'll defer it until after
           // react is done with this frame.
@@ -80,8 +80,8 @@ export class ModifiedImageDiff extends React.Component<
 
           this.resizedTimeoutID = setImmediate(
             this.onResized,
-            entry.target,
-            entry.contentRect
+            target,
+            contentRect
           )
         }
       }
@@ -148,8 +148,6 @@ export class ModifiedImageDiff extends React.Component<
   public render() {
     return (
       <div className="panel image" id="diff">
-        {this.renderCurrentDiffType()}
-
         <TabBar
           selectedIndex={this.props.diffType}
           onTabClicked={this.props.onChangeDiffType}
@@ -160,6 +158,8 @@ export class ModifiedImageDiff extends React.Component<
           <span>Onion Skin</span>
           <span>Difference</span>
         </TabBar>
+
+        {this.renderCurrentDiffType()}
       </div>
     )
   }

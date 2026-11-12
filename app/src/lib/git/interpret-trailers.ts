@@ -1,4 +1,4 @@
-import { git } from './core'
+import { git, IGitExecutionOptions } from './core'
 import { Repository } from '../../models/repository'
 import { getConfigValue } from './config'
 
@@ -153,9 +153,13 @@ export async function mergeTrailers(
   repository: Repository,
   commitMessage: string,
   trailers: ReadonlyArray<ITrailer>,
-  unfold: boolean = false
+  unfold: boolean = false,
+  options?: Pick<IGitExecutionOptions, 'env'>
 ) {
   const args = ['interpret-trailers']
+
+  // See https://github.com/git/git/blob/ebf3c04b262aa/Documentation/git-interpret-trailers.txt#L129-L132
+  args.push('--no-divider')
 
   if (unfold) {
     args.push('--unfold')
@@ -166,6 +170,7 @@ export async function mergeTrailers(
   }
 
   const result = await git(args, repository.path, 'mergeTrailers', {
+    ...options,
     stdin: commitMessage,
   })
 

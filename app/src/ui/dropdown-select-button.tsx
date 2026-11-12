@@ -1,0 +1,471 @@
+import classNames from 'classnames'
+import React from 'react'
+import { Button } from './lib/button'
+import { Octicon } from './octicons'
+import * as octicons from './octicons/octicons.generated'
+import { MenuPane } from './app-menu'
+import { ICheckboxMenuItem, MenuItem } from '../models/app-menu'
+import { ClickSource, SelectionSource } from './lib/list'
+
+export interface IDropdownSelectButtonOption {
+  /** The select option header label. */
+  readonly label: string
+
+  /** The select option description */
+  readonly description?: string | JSX.Element
+
+  /** The select option's value */
+  readonly id: string
+}
+
+interface IDropdownSelectButtonProps {
+  /** The selection button options */
+  readonly options: ReadonlyArray<IDropdownSelectButtonOption>
+
+  /** The selection option value */
+  readonly checkedOption?: string
+
+  /** Whether or not the button is enabled */
+  readonly disabled?: boolean
+
+  /**
+   * Whether or not the dropdown toggle is disabled. When not provided the
+   * toggle is only styled as disabled when `disabled` is true.
+   */
+  readonly dropdownDisabled?: boolean
+
+  /** tooltip for the button */
+  readonly tooltip?: string
+
+  /** Whether the tooltip should only be shown when the button text overflows */
+  readonly onlyShowTooltipWhenOverflowed?: boolean
+
+  /** Whether the tooltip can be dismissed by the user */
+  readonly tooltipDismissable?: boolean
+
+  /** An optional class name for the component's container */
+  readonly className?: string
+
+  /**
+   * Optional content to render inside the invoke button. When not provided the
+   * label of the checked option is used.
+   */
+  readonly renderInvokeButtonContent?: (
+    checkedOption: IDropdownSelectButtonOption
+  ) => React.ReactNode
+
+  /** aria-describedby for the button */
+  readonly ariaDescribedBy?: string
+
+  /** aria-label for the dropdown button */
+  readonly dropdownAriaLabel: string
+
+  /** Callback for when the button selection changes*/
+  readonly onCheckedOptionChange?: (
+    selectedOption: IDropdownSelectButtonOption
+  ) => void
+
+  /** Callback for when button is selected option button is clicked */
+  readonly onSubmit?: (
+    event: React.MouseEvent<HTMLButtonElement>,
+    selectedOption: IDropdownSelectButtonOption
+  ) => void
+}
+
+interface IDropdownSelectButtonState {
+  /** Whether the options are rendered */
+  readonly showButtonOptions: boolean
+
+  /** The currently checked option (not necessarily highlighted, but is the only option checked) */
+  readonly checkedOption: IDropdownSelectButtonOption | null
+
+  /** The currently selected option -> The option highlighted that if clicked or hit enter on would become checked */
+  readonly selectedOption: IDropdownSelectButtonOption | null
+
+  /**
+   * The adjusting position of the options popover. This is calculated based
+   * on if there is enough room to show the options below the dropdown button.
+   */
+  readonly optionsPositionBottom?: string
+}
+
+export class DropdownSelectButton extends React.Component<
+  IDropdownSelectButtonProps,
+  IDropdownSelectButtonState
+> {
+  private invokeButtonRef: HTMLButtonElement | null = null
+  private dropdownButtonRef: HTMLButtonElement | null = null
+  private optionsContainerRef: HTMLDivElement | null = null
+  private dropdownSelectContainerRef = React.createRef<HTMLDivElement>()
+
+  public constructor(props: IDropdownSelectButtonProps) {
+    super(props)
+
+    this.state = {
+      showButtonOptions: false,
+      checkedOption: this.getCheckedOption(props.checkedOption),
+      selectedOption: this.getCheckedOption(props.checkedOption),
+    }
+  }
+
+  public componentDidMount(): void {
+    if (this.dropdownSelectContainerRef.current) {
+      this.dropdownSelectContainerRef.current.addEventListener(
+        'focusout',
+        this.onFocusOut
+      )
+    }
+  }
+
+  public componentWillUnmount(): void {
+    if (this.dropdownSelectContainerRef.current) {
+      this.dropdownSelectContainerRef.current.removeEventListener(
+        'focusout',
+        this.onFocusOut
+      )
+    }
+  }
+
+  private onFocusOut = (event: FocusEvent) => {
+    if (
+      this.state.showButtonOptions &&
+      !(
+        event.relatedTarget instanceof Node &&
+        this.dropdownSelectContainerRef.current?.contains(event.relatedTarget)
+      )
+    ) {
+      this.setState({ showButtonOptions: false })
+    }
+  }
+
+  public componentDidUpdate(prevProps: IDropdownSelectButtonProps) {
+    if (this.props.dropdownDisabled && this.state.showButtonOptions) {
+      this.setState({ showButtonOptions: false })
+      this.dropdownButtonRef?.focus()
+      return
+    }
+
+    const selectedOptionID = this.state.selectedOption?.id
+    const selectedOptionRemoved =
+      selectedOptionID !== undefined &&
+      !this.props.options.some(option => option.id === selectedOptionID)
+    if (
+      prevProps.checkedOption !== this.props.checkedOption ||
+      selectedOptionRemoved
+    ) {
+      this.setState({ selectedOption: this.checkedOption })
+    }
+
+    if (this.invokeButtonRef === null || this.optionsContainerRef === null) {
+      return
+    }
+
+    const windowHeight = window.innerHeight
+    const bottomOfButton = this.invokeButtonRef.getBoundingClientRect().bottom
+    const invokeButtonHeight =
+      this.invokeButtonRef.getBoundingClientRect().height
+    // 15 pixels is just to give some padding room below it
+    const calcMaxHeight = windowHeight - bottomOfButton - 15
+    const heightOfOptions = this.optionsContainerRef.clientHeight
+    const optionsPositionBottom =
+      calcMaxHeight < heightOfOptions ? `${invokeButtonHeight}px` : undefined
+    if (optionsPositionBottom !== this.state.optionsPositionBottom) {
+      this.setState({ optionsPositionBottom })
+    }
+  }
+
+  /** Move keyboard focus to the primary action. */
+  public focus() {
+    this.invokeButtonRef?.focus()
+  }
+
+  private get checkedOption(): IDropdownSelectButtonOption | null {
+    return this.getCheckedOption(
+      this.props.checkedOption ?? this.state.checkedOption?.id
+    )
+  }
+
+  private getCheckedOption(
+    selectedValue: string | undefined
+  ): IDropdownSelectButtonOption | null {
+    const { options } = this.props
+    if (options.length === 0) {
+      return null
+    }
+
+    const selectedOption = options.find(o => o.id === selectedValue)
+    return selectedOption ?? options[0]
+  }
+
+  private onItemClick = (
+    depth: number,
+    item: MenuItem,
+    source: ClickSource
+  ) => {
+    if (this.props.dropdownDisabled) {
+      return
+    }
+
+    const selectedOption = this.props.options.find(o => o.id === item.id)
+
+    if (!selectedOption) {
+      return
+    }
+
+    this.setState({ checkedOption: selectedOption, showButtonOptions: false })
+    this.dropdownButtonRef?.focus()
+    this.props.onCheckedOptionChange?.(selectedOption)
+  }
+
+  private onClearSelection = () => {
+    this.setState({ selectedOption: null })
+  }
+
+  private onPaneKeyDown = (
+    depth: number | undefined,
+    event: React.KeyboardEvent<HTMLDivElement>
+  ) => {
+    if (event.key !== 'Escape' && event.key !== 'Esc') {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    this.dropdownButtonRef?.focus()
+    this.setState({ showButtonOptions: false })
+  }
+
+  private onSelectionChanged = (
+    depth: number,
+    item: MenuItem,
+    source: SelectionSource
+  ) => {
+    const selectedOption = this.props.options.find(o => o.id === item.id)
+
+    if (!selectedOption) {
+      return
+    }
+
+    this.setState({ selectedOption })
+  }
+
+  private openSplitButtonDropdown = () => {
+    if (!this.props.dropdownDisabled) {
+      this.setState({ showButtonOptions: !this.state.showButtonOptions })
+    }
+  }
+
+  private onDropdownButtonKeyDown = (
+    event: React.KeyboardEvent<HTMLButtonElement>
+  ) => {
+    if (
+      this.props.dropdownDisabled ||
+      (event.key === 'Enter' && (event.metaKey || event.ctrlKey))
+    ) {
+      return
+    }
+
+    const { key } = event
+    let flag = false
+
+    switch (key) {
+      case ' ':
+      case 'Enter':
+      case 'ArrowDown':
+      case 'Down':
+        this.setState({
+          selectedOption: this.props.options.at(0) ?? null,
+          showButtonOptions: true,
+        })
+        flag = true
+        break
+
+      case 'Esc':
+      case 'Escape':
+        this.dropdownButtonRef?.focus()
+        this.setState({ showButtonOptions: false })
+        flag = true
+        break
+
+      case 'Up':
+      case 'ArrowUp':
+        this.setState({
+          selectedOption: this.props.options.at(-1) ?? null,
+          showButtonOptions: true,
+        })
+        flag = true
+        break
+
+      default:
+        break
+    }
+
+    if (flag) {
+      event.stopPropagation()
+      event.preventDefault()
+    }
+  }
+
+  private onInvokeButtonRef = (buttonRef: HTMLButtonElement | null) => {
+    this.invokeButtonRef = buttonRef
+  }
+
+  private onDropdownButtonRef = (buttonRef: HTMLButtonElement | null) => {
+    this.dropdownButtonRef = buttonRef
+  }
+
+  private onOptionsContainerRef = (ref: HTMLDivElement | null) => {
+    this.optionsContainerRef = ref
+  }
+
+  private renderOption = (item: MenuItem) => {
+    const option = this.props.options.find(o => o.id === item.id)
+    if (!option) {
+      return
+    }
+
+    return (
+      <>
+        <div className="option-title">{option.label}</div>
+        <div className="option-description">{option.description}</div>
+      </>
+    )
+  }
+
+  private getMenuItems(
+    options: ReadonlyArray<IDropdownSelectButtonOption>,
+    checkedOptionId: string | undefined
+  ): ReadonlyArray<MenuItem> {
+    const defaultCheckBoxMenuItem: ICheckboxMenuItem = {
+      type: 'checkbox',
+      id: '',
+      label: '',
+      checked: false,
+      enabled: true,
+      visible: true,
+      accelerator: null,
+      accessKey: null,
+    }
+
+    return options.map(({ id, label }) => {
+      const checked = checkedOptionId === id
+      return { ...defaultCheckBoxMenuItem, ...{ id, label, checked } }
+    })
+  }
+
+  private renderSplitButtonOptions() {
+    const {
+      showButtonOptions,
+      selectedOption,
+      optionsPositionBottom: bottom,
+    } = this.state
+
+    if (!showButtonOptions || this.props.dropdownDisabled) {
+      return
+    }
+
+    const { options } = this.props
+
+    const items = this.getMenuItems(options, this.checkedOption?.id)
+    const selectedItem = items.find(i => i.id === selectedOption?.id)
+    const openClass = bottom !== undefined ? 'open-top' : 'open-bottom'
+    const classes = classNames('dropdown-select-button-options', openClass)
+
+    return (
+      <div
+        className={classes}
+        style={{ bottom }}
+        ref={this.onOptionsContainerRef}
+      >
+        <MenuPane
+          depth={0}
+          items={items}
+          selectedItem={selectedItem}
+          onItemClicked={this.onItemClick}
+          onKeyDown={this.onPaneKeyDown}
+          onSelectionChanged={this.onSelectionChanged}
+          onClearSelection={this.onClearSelection}
+          allowFirstCharacterNavigation={true}
+          renderLabel={this.renderOption}
+        />
+      </div>
+    )
+  }
+
+  private onSubmit = (event: React.MouseEvent<HTMLButtonElement>) => {
+    const checkedOption = this.checkedOption
+    if (
+      !this.props.disabled &&
+      this.props.onSubmit !== undefined &&
+      checkedOption !== null
+    ) {
+      this.props.onSubmit(event, checkedOption)
+    }
+  }
+
+  public render() {
+    const {
+      options,
+      disabled,
+      dropdownDisabled,
+      dropdownAriaLabel,
+      renderInvokeButtonContent,
+    } = this.props
+    const { optionsPositionBottom, showButtonOptions } = this.state
+    const selectedOption = this.checkedOption
+    if (options.length === 0 || selectedOption === null) {
+      return
+    }
+
+    const openClass =
+      optionsPositionBottom !== undefined ? 'open-top' : 'open-bottom'
+    const containerClasses = classNames(
+      'dropdown-select-button',
+      this.props.className,
+      showButtonOptions ? openClass : null
+    )
+
+    const dropdownClasses = classNames('dropdown-button', {
+      disabled: dropdownDisabled ?? disabled,
+    })
+    // The button is type of submit so that it will trigger a form's onSubmit
+    // method.
+    return (
+      <div className={containerClasses} ref={this.dropdownSelectContainerRef}>
+        <div className="dropdown-button-wrappers">
+          <Button
+            className="invoke-button"
+            disabled={disabled}
+            type="submit"
+            ariaDescribedBy={this.props.ariaDescribedBy}
+            tooltip={this.props.tooltip}
+            onlyShowTooltipWhenOverflowed={
+              this.props.onlyShowTooltipWhenOverflowed
+            }
+            tooltipDismissable={this.props.tooltipDismissable}
+            onButtonRef={this.onInvokeButtonRef}
+            onClick={this.onSubmit}
+          >
+            {renderInvokeButtonContent !== undefined
+              ? renderInvokeButtonContent(selectedOption)
+              : selectedOption.label}
+          </Button>
+          <Button
+            className={dropdownClasses}
+            onClick={this.openSplitButtonDropdown}
+            onKeyDown={this.onDropdownButtonKeyDown}
+            onButtonRef={this.onDropdownButtonRef}
+            disabled={dropdownDisabled}
+            type="button"
+            ariaExpanded={showButtonOptions}
+            ariaHaspopup={true}
+            ariaLabel={dropdownAriaLabel}
+          >
+            <Octicon symbol={octicons.triangleDown} />
+          </Button>
+        </div>
+        {this.renderSplitButtonOptions()}
+      </div>
+    )
+  }
+}

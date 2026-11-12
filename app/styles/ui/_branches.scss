@@ -15,10 +15,29 @@
     min-height: 0;
   }
 
+  &.resizable {
+    width: 100%;
+
+    .branches-list {
+      width: 100%;
+
+      &-item {
+        .name {
+          max-width: unset;
+        }
+      }
+    }
+
+    .no-pull-requests {
+      margin: var(--spacing) auto;
+    }
+  }
+
   .branches-list-item {
     height: 100%;
 
-    div {
+    // While dragging we don't want tooltips from the underlying item to show
+    &.drop-target * {
       pointer-events: none;
     }
 
@@ -28,6 +47,11 @@
       flex-grow: revert;
     }
   }
+}
+
+.branches-container-panel {
+  display: flex;
+  flex: 1;
 }
 
 .pull-request-tab {
@@ -89,7 +113,8 @@
     flex-grow: 1;
     height: 100%;
 
-    div {
+    // While dragging we don't want tooltips from the underlying item to show
+    &.drop-target div {
       pointer-events: none;
     }
 

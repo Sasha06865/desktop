@@ -8,21 +8,41 @@ import {
 import { IAutocompletionProvider } from './index'
 import { fatalError } from '../../lib/fatal-error'
 import classNames from 'classnames'
+import getCaretCoordinates from 'textarea-caret'
+import { showContextualMenu } from '../../lib/menu-item'
+import { AriaLiveContainer } from '../accessibility/aria-live-container'
+import { createUniqueId, releaseUniqueId } from '../lib/id-pool'
+import {
+  Popover,
+  PopoverAnchorPosition,
+  PopoverDecoration,
+} from '../lib/popover'
 
 interface IRange {
   readonly start: number
   readonly length: number
 }
 
-import getCaretCoordinates from 'textarea-caret'
-import { showContextualMenu } from '../main-process-proxy'
+interface IAutocompletingTextInputProps<ElementType, AutocompleteItemType> {
+  /** An optional specified id for the input */
+  readonly inputId?: string
 
-interface IAutocompletingTextInputProps<ElementType> {
   /**
    * An optional className to be applied to the rendered
    * top level element of the component.
    */
   readonly className?: string
+
+  /** Element ID for the input field. */
+  readonly elementId?: string
+
+  /** Content of an optional invisible label element for screen readers. */
+  readonly screenReaderLabel?: string
+
+  /**
+   * The label of the text box.
+   */
+  readonly label?: string | JSX.Element
 
   /** The placeholder for the input field. */
   readonly placeholder?: string
@@ -30,14 +50,20 @@ interface IAutocompletingTextInputProps<ElementType> {
   /** The current value of the input field. */
   readonly value?: string
 
-  /** Disabled state for input field. */
-  readonly disabled?: boolean
+  /** Whether or not the input should be read-only and styled as disabled */
+  readonly readOnly?: boolean
 
   /** Indicates if input field should be required */
-  readonly isRequired?: boolean
+  readonly required?: boolean
 
   /** Indicates if input field applies spellcheck */
   readonly spellcheck?: boolean
+
+  /** Indicates if it should always try to autocomplete. Optional (defaults to false) */
+  readonly alwaysAutocomplete?: boolean
+
+  /** Filter for autocomplete items */
+  readonly autocompleteItemFilter?: (item: AutocompleteItemType) => boolean
 
   /**
    * Called when the user changes the value in the input field.
@@ -46,6 +72,9 @@ interface IAutocompletingTextInputProps<ElementType> {
 
   /** Called on key down. */
   readonly onKeyDown?: (event: React.KeyboardEvent<ElementType>) => void
+
+  /** Called when an autocomplete item has been selected. */
+  readonly onAutocompleteItemSelected?: (value: AutocompleteItemType) => void
 
   /**
    * A list of autocompletion providers that should be enabled for this
@@ -64,6 +93,31 @@ interface IAutocompletingTextInputProps<ElementType> {
    * in the input field.
    */
   readonly onContextMenu?: (event: React.MouseEvent<any>) => void
+
+  /** Called when the input field receives focus. */
+  readonly onFocus?: (event: React.FocusEvent<ElementType>) => void
+
+  /** Called when the input field loses focus. */
+  readonly onBlur?: (value: string) => void
+
+  /** The aria-labelledby attribute for the input element. */
+  readonly ariaLabelledBy?: string
+
+  /** The aria-describedby attribute for the input element. */
+  readonly ariaDescribedBy?: string
+
+  /**
+   * An optional suffix to be appended to the autocompletion text when an item is completed,
+   * defaults to ' '
+   */
+  readonly completionSuffix?: string
+
+  /** Whether the autocompletion popup should be anchored to the caret position
+   * instead of the input/textarea element. Optional (defaults to true) */
+  readonly anchorToCaret?: boolean
+
+  /** Offset to apply to the distance from the anchor */
+  readonly anchorOffset?: number
 }
 
 interface IAutocompletionState<T> {
@@ -72,18 +126,14 @@ interface IAutocompletionState<T> {
   readonly range: IRange
   readonly rangeText: string
   readonly selectedItem: T | null
+  readonly selectedRowId: string | undefined
+  readonly itemListRowIdPrefix: string
 }
 
 /**
  * The height of the autocompletion result rows.
  */
 const RowHeight = 29
-
-/**
- * The amount to offset on the Y axis so that the popup is displayed below the
- * current line.
- */
-const YOffset = 20
 
 /**
  * The default height for the popup. Note that the actual height may be
@@ -97,16 +147,36 @@ interface IAutocompletingTextInputState<T> {
    * matching autocompletion providers.
    */
   readonly autocompletionState: IAutocompletionState<T> | null
+
+  /** Coordinates of the caret in the input/textarea element */
+  readonly caretCoordinates: ReturnType<typeof getCaretCoordinates> | null
+
+  /**
+   * An automatically generated id for the text element used to reference
+   * it from the label element. This is generated once via the id pool when the
+   * component is mounted and then released once the component unmounts.
+   */
+  readonly uniqueInternalElementId?: string
+
+  /**
+   * An automatically generated id for the autocomplete container element used
+   * to reference it from the ARIA autocomplete-related attributes. This is
+   * generated once via the id pool when the component is mounted and then
+   * released once the component unmounts.
+   */
+  readonly autocompleteContainerId?: string
 }
 
 /** A text area which provides autocompletions as the user types. */
 export abstract class AutocompletingTextInput<
-  ElementType extends HTMLInputElement | HTMLTextAreaElement
+  ElementType extends HTMLInputElement | HTMLTextAreaElement,
+  AutocompleteItemType extends object
 > extends React.Component<
-  IAutocompletingTextInputProps<ElementType>,
-  IAutocompletingTextInputState<Object>
+  IAutocompletingTextInputProps<ElementType, AutocompleteItemType>,
+  IAutocompletingTextInputState<AutocompleteItemType>
 > {
   private element: ElementType | null = null
+  private invisibleCaretRef = React.createRef<HTMLDivElement>()
 
   /** The identifier for each autocompletion request. */
   private autocompletionRequestID = 0
@@ -117,10 +187,67 @@ export abstract class AutocompletingTextInput<
    */
   protected abstract getElementTagName(): 'textarea' | 'input'
 
-  public constructor(props: IAutocompletingTextInputProps<ElementType>) {
+  public constructor(
+    props: IAutocompletingTextInputProps<ElementType, AutocompleteItemType>
+  ) {
     super(props)
 
-    this.state = { autocompletionState: null }
+    this.state = {
+      autocompletionState: null,
+      caretCoordinates: null,
+    }
+  }
+
+  public componentWillMount() {
+    const elementId =
+      this.props.inputId ?? createUniqueId('autocompleting-text-input')
+    const autocompleteContainerId = createUniqueId('autocomplete-container')
+
+    this.setState({
+      uniqueInternalElementId: elementId,
+      autocompleteContainerId,
+    })
+  }
+
+  public componentWillUnmount() {
+    this.autocompletionRequestID++
+    if (this.state.uniqueInternalElementId) {
+      releaseUniqueId(this.state.uniqueInternalElementId)
+    }
+
+    if (this.state.autocompleteContainerId) {
+      releaseUniqueId(this.state.autocompleteContainerId)
+    }
+  }
+
+  public componentDidUpdate(
+    prevProps: IAutocompletingTextInputProps<ElementType, AutocompleteItemType>
+  ) {
+    if (this.props.readOnly === true && prevProps.readOnly !== true) {
+      this.close()
+      return
+    }
+
+    if (
+      this.props.autocompleteItemFilter !== prevProps.autocompleteItemFilter &&
+      this.state.autocompletionState !== null
+    ) {
+      this.open(this.element?.value ?? '')
+    }
+  }
+
+  private get elementId() {
+    return this.props.elementId ?? this.state.uniqueInternalElementId
+  }
+
+  private getItemAriaLabel = (row: number): string | undefined => {
+    const state = this.state.autocompletionState
+    if (!state) {
+      return undefined
+    }
+
+    const item = state.items[row]
+    return state.provider.getItemAriaLabel?.(item)
   }
 
   private renderItem = (row: number): JSX.Element | null => {
@@ -130,17 +257,17 @@ export abstract class AutocompletingTextInput<
     }
 
     const item = state.items[row]
-    const selected = item === state.selectedItem ? 'selected' : ''
+    const selected = item === state.selectedItem
     return (
-      <div className={`autocompletion-item ${selected}`}>
-        {state.provider.renderItem(item)}
+      <div className={`autocompletion-item ${selected ? 'selected' : ''}`}>
+        {state.provider.renderItem(item, selected)}
       </div>
     )
   }
 
   private renderAutocompletions() {
     const state = this.state.autocompletionState
-    if (!state) {
+    if (!state || this.props.readOnly === true) {
       return null
     }
 
@@ -149,35 +276,9 @@ export abstract class AutocompletingTextInput<
       return null
     }
 
-    const element = this.element!
-    let coordinates = getCaretCoordinates(element, state.range.start)
-    coordinates = {
-      ...coordinates,
-      top: coordinates.top - element.scrollTop,
-      left: coordinates.left - element.scrollLeft,
-    }
-
-    const left = coordinates.left
-    const top = coordinates.top + YOffset
-    const selectedRow = state.selectedItem
-      ? items.indexOf(state.selectedItem)
-      : -1
-    const rect = element.getBoundingClientRect()
-    const popupAbsoluteTop = rect.top + coordinates.top
-
-    // The maximum height we can use for the popup without it extending beyond
-    // the Window bounds.
-    let maxHeight: number
-    if (
-      element.ownerDocument !== null &&
-      element.ownerDocument.defaultView !== null
-    ) {
-      const windowHeight = element.ownerDocument.defaultView.innerHeight
-      const spaceToBottomOfWindow = windowHeight - popupAbsoluteTop - YOffset
-      maxHeight = Math.min(DefaultPopupHeight, spaceToBottomOfWindow)
-    } else {
-      maxHeight = DefaultPopupHeight
-    }
+    const selectedRows = state.selectedItem
+      ? [items.indexOf(state.selectedItem)]
+      : []
 
     // The height needed to accommodate all the matched items without overflowing
     //
@@ -186,7 +287,7 @@ export abstract class AutocompletingTextInput<
     // without overflowing and triggering the scrollbar.
     const noOverflowItemHeight = RowHeight * items.length
 
-    const height = Math.min(noOverflowItemHeight, maxHeight)
+    const minHeight = RowHeight * Math.min(items.length, 3)
 
     // Use the completion text as invalidation props so that highlighting
     // will update as you type even though the number of items matched
@@ -198,22 +299,63 @@ export abstract class AutocompletingTextInput<
     const className = classNames('autocompletion-popup', state.provider.kind)
 
     return (
-      <div className={className} style={{ top, left, height }}>
+      <Popover
+        anchor={
+          this.props.anchorToCaret === false
+            ? this.element
+            : this.invisibleCaretRef.current
+        }
+        anchorPosition={PopoverAnchorPosition.BottomLeft}
+        anchorOffset={this.props.anchorOffset}
+        decoration={PopoverDecoration.None}
+        maxHeight={Math.min(DefaultPopupHeight, noOverflowItemHeight)}
+        minHeight={minHeight}
+        trapFocus={false}
+        className={className}
+        isDialog={false}
+      >
         <List
+          accessibleListId={this.state.autocompleteContainerId}
+          ref={this.onAutocompletionListRef}
           rowCount={items.length}
           rowHeight={RowHeight}
-          selectedRows={[selectedRow]}
+          rowId={this.getRowId}
+          selectedRows={selectedRows}
           rowRenderer={this.renderItem}
-          scrollToRow={selectedRow}
-          selectOnHover={true}
-          focusOnHover={false}
+          getRowAriaLabel={this.getItemAriaLabel}
+          scrollToRow={selectedRows.at(0)}
           onRowMouseDown={this.onRowMouseDown}
           onRowClick={this.insertCompletionOnClick}
           onSelectedRowChanged={this.onSelectedRowChanged}
           invalidationProps={searchText}
+          // Disable tab focus so that the user can't tab to the list of autocompletions
+          // Focus belongs to the input field.
+          shouldDisableTabFocus={true}
         />
-      </div>
+      </Popover>
     )
+  }
+
+  private getRowId: (row: number) => string = row => {
+    const state = this.state.autocompletionState
+    if (!state) {
+      return ''
+    }
+
+    return `autocomplete-item-row-${state.itemListRowIdPrefix}-${row}`
+  }
+
+  private onAutocompletionListRef = (ref: List | null) => {
+    const { autocompletionState } = this.state
+    if (ref && autocompletionState && autocompletionState.selectedItem) {
+      const { items, selectedItem } = autocompletionState
+      this.setState({
+        autocompletionState: {
+          ...autocompletionState,
+          selectedRowId: this.getRowId(items.indexOf(selectedItem)),
+        },
+      })
+    }
   }
 
   private onRowMouseDown = (row: number, event: React.MouseEvent<any>) => {
@@ -242,6 +384,7 @@ export abstract class AutocompletingTextInput<
     const newAutoCompletionState = {
       ...currentAutoCompletionState,
       selectedItem: newSelectedItem,
+      selectedRowId: newSelectedItem === null ? undefined : this.getRowId(row),
     }
 
     this.setState({ autocompletionState: newAutoCompletionState })
@@ -272,19 +415,61 @@ export abstract class AutocompletingTextInput<
     }
   }
 
+  private getActiveAutocompleteItemId(): string | undefined {
+    const { autocompletionState } = this.state
+
+    if (autocompletionState === null || this.props.readOnly === true) {
+      return undefined
+    }
+
+    if (autocompletionState.selectedRowId) {
+      return autocompletionState.selectedRowId
+    }
+
+    if (autocompletionState.selectedItem === null) {
+      return undefined
+    }
+
+    const index = autocompletionState.items.indexOf(
+      autocompletionState.selectedItem
+    )
+
+    return this.getRowId(index)
+  }
+
   private renderTextInput() {
+    const { autocompletionState } = this.state
+
+    const autocompleteVisible =
+      this.props.readOnly !== true &&
+      autocompletionState !== null &&
+      autocompletionState.items.length > 0
+
     const props = {
       type: 'text',
+      id: this.elementId,
+      role: 'combobox',
       placeholder: this.props.placeholder,
       value: this.props.value,
       ref: this.onRef,
       onChange: this.onChange,
+      onScroll: this.onScroll,
       onKeyDown: this.onKeyDown,
+      onFocus: this.onFocus,
       onBlur: this.onBlur,
       onContextMenu: this.onContextMenu,
-      disabled: this.props.disabled,
-      'aria-required': this.props.isRequired ? true : false,
+      readOnly: this.props.readOnly,
+      required: this.props.required ? true : false,
       spellCheck: this.props.spellcheck,
+      autoComplete: 'off',
+      'aria-expanded': autocompleteVisible,
+      'aria-autocomplete': 'list' as const,
+      'aria-haspopup': 'listbox' as const,
+      'aria-controls': this.state.autocompleteContainerId,
+      'aria-owns': this.state.autocompleteContainerId,
+      'aria-activedescendant': this.getActiveAutocompleteItemId(),
+      'aria-labelledby': this.props.ariaLabelledBy,
+      'aria-describedby': this.props.ariaDescribedBy,
     }
 
     return React.createElement<React.HTMLAttributes<ElementType>, ElementType>(
@@ -293,12 +478,84 @@ export abstract class AutocompletingTextInput<
     )
   }
 
+  // This will update the caret coordinates in the componen state, so that the
+  // "invisible caret" can be positioned correctly.
+  // Given the outcome of this function depends on both the caret coordinates
+  // and the scroll position, it should be called whenever the caret moves (on
+  // text changes) or the scroll position changes.
+  private updateCaretCoordinates = () => {
+    const element = this.element
+    if (!element) {
+      this.setState({ caretCoordinates: null })
+      return
+    }
+
+    const selectionEnd = element.selectionEnd
+    if (selectionEnd === null) {
+      this.setState({ caretCoordinates: null })
+      return
+    }
+
+    const caretCoordinates = getCaretCoordinates(element, selectionEnd)
+
+    this.setState({
+      caretCoordinates: {
+        top: caretCoordinates.top - element.scrollTop,
+        left: caretCoordinates.left - element.scrollLeft,
+        height: caretCoordinates.height,
+      },
+    })
+  }
+
+  private renderInvisibleCaret = () => {
+    const { caretCoordinates } = this.state
+    if (!caretCoordinates) {
+      return null
+    }
+
+    if (this.props.anchorToCaret === false) {
+      return null
+    }
+
+    return (
+      <div
+        style={{
+          backgroundColor: 'transparent',
+          width: 2,
+          position: 'absolute',
+          left: caretCoordinates.left,
+          top: caretCoordinates.top,
+        }}
+        ref={this.invisibleCaretRef}
+      >
+        &nbsp;
+      </div>
+    )
+  }
+
   private onBlur = (e: React.FocusEvent<ElementType>) => {
     this.close()
+
+    if (this.props.onBlur !== undefined && this.element !== null) {
+      this.props.onBlur(this.element.value)
+    }
+  }
+
+  private onFocus = (e: React.FocusEvent<ElementType>) => {
+    if (!this.props.alwaysAutocomplete || this.element === null) {
+      return
+    }
+
+    this.open(this.element.value)
+
+    this.props.onFocus?.(e)
   }
 
   private onRef = (ref: ElementType | null) => {
     this.element = ref
+    if (ref !== null) {
+      this.updateCaretCoordinates()
+    }
     if (this.props.onElementRef) {
       this.props.onElementRef(ref)
     }
@@ -314,17 +571,40 @@ export abstract class AutocompletingTextInput<
     const tagName = this.getElementTagName()
     const className = classNames(
       'autocompletion-container',
+      'no-invalid-state',
       this.props.className,
       {
         'text-box-component': tagName === 'input',
         'text-area-component': tagName === 'textarea',
       }
     )
+    const { label, screenReaderLabel } = this.props
+
+    const autoCompleteItems =
+      this.props.readOnly === true
+        ? []
+        : this.state.autocompletionState?.items ?? []
+
+    const suggestionsMessage =
+      autoCompleteItems.length === 1
+        ? '1 suggestion'
+        : `${autoCompleteItems.length} suggestions`
+
     return (
       <div className={className}>
         {this.renderAutocompletions()}
-
+        {screenReaderLabel && label === undefined && (
+          <label className="sr-only" htmlFor={this.elementId}>
+            {screenReaderLabel}
+          </label>
+        )}
+        {label && <label htmlFor={this.elementId}>{label}</label>}
         {this.renderTextInput()}
+        {this.renderInvisibleCaret()}
+        <AriaLiveContainer
+          message={autoCompleteItems.length > 0 ? suggestionsMessage : null}
+          trackedUserInput={this.state.autocompletionState?.rangeText}
+        />
       </div>
     )
   }
@@ -339,20 +619,32 @@ export abstract class AutocompletingTextInput<
     this.element.selectionEnd = newCaretPosition
   }
 
-  private insertCompletion(item: Object, source: 'mouseclick' | 'keyboard') {
-    const element = this.element!
-    const autocompletionState = this.state.autocompletionState!
+  private insertCompletion(
+    item: AutocompleteItemType,
+    source: 'mouseclick' | 'keyboard'
+  ) {
+    const element = this.element
+    const autocompletionState = this.state.autocompletionState
+    if (
+      this.props.readOnly === true ||
+      element === null ||
+      autocompletionState === null
+    ) {
+      return
+    }
     const originalText = element.value
     const range = autocompletionState.range
-    const autoCompleteText = autocompletionState.provider.getCompletionText(
-      item
-    )
+    const autoCompleteText =
+      autocompletionState.provider.getCompletionText(item)
 
     const textWithAutoCompleteText =
-      originalText.substr(0, range.start - 1) + autoCompleteText + ' '
+      originalText.substr(0, range.start - 1) +
+      autoCompleteText +
+      (this.props.completionSuffix ?? ' ')
 
     const newText =
-      textWithAutoCompleteText + originalText.substr(range.start + range.length)
+      textWithAutoCompleteText +
+      originalText.substring(range.start + range.length)
 
     element.value = newText
 
@@ -373,7 +665,12 @@ export abstract class AutocompletingTextInput<
       this.setCursorPosition(newCaretPosition)
     }
 
+    this.props.onAutocompleteItemSelected?.(item)
+
     this.close()
+    if (this.props.alwaysAutocomplete) {
+      this.open('')
+    }
   }
 
   private getMovementDirection(
@@ -394,7 +691,7 @@ export abstract class AutocompletingTextInput<
       this.props.onKeyDown(event)
     }
 
-    if (event.defaultPrevented) {
+    if (event.defaultPrevented || this.props.readOnly === true) {
       return
     }
 
@@ -429,11 +726,16 @@ export abstract class AutocompletingTextInput<
         const newAutoCompletionState = {
           ...currentAutoCompletionState,
           selectedItem: newSelectedItem,
+          selectedRowId:
+            newSelectedItem === null ? undefined : this.getRowId(nextRow),
         }
 
         this.setState({ autocompletionState: newAutoCompletionState })
       }
-    } else if (event.key === 'Enter' || event.key === 'Tab') {
+    } else if (
+      event.key === 'Enter' ||
+      (event.key === 'Tab' && !event.shiftKey)
+    ) {
       const item = currentAutoCompletionState.selectedItem
       if (item) {
         event.preventDefault()
@@ -441,18 +743,22 @@ export abstract class AutocompletingTextInput<
         this.insertCompletion(item, 'keyboard')
       }
     } else if (event.key === 'Escape') {
+      event.preventDefault()
       this.close()
     }
   }
 
   private close() {
+    this.autocompletionRequestID++
     this.setState({ autocompletionState: null })
   }
 
   private async attemptAutocompletion(
     str: string,
     caretPosition: number
-  ): Promise<IAutocompletionState<any> | null> {
+  ): Promise<IAutocompletionState<AutocompleteItemType> | null> {
+    const lowercaseStr = str.toLowerCase()
+
     for (const provider of this.props.autocompletionProviders) {
       // NB: RegExps are stateful (AAAAAAAAAAAAAAAAAA) so defensively copy the
       // regex we're given.
@@ -464,15 +770,26 @@ export abstract class AutocompletingTextInput<
       }
 
       let result: RegExpExecArray | null = null
-      while ((result = regex.exec(str))) {
+      while ((result = regex.exec(lowercaseStr))) {
         const index = regex.lastIndex
         const text = result[1] || ''
-        if (index === caretPosition) {
+        if (index === caretPosition || this.props.alwaysAutocomplete) {
           const range = { start: index - text.length, length: text.length }
-          const items = await provider.getAutocompletionItems(text)
+          let items = await provider.getAutocompletionItems(text)
 
-          const selectedItem = items[0]
-          return { provider, items, range, selectedItem, rangeText: text }
+          if (this.props.autocompleteItemFilter) {
+            items = items.filter(this.props.autocompleteItemFilter)
+          }
+
+          return {
+            provider,
+            items,
+            range,
+            selectedItem: null,
+            selectedRowId: undefined,
+            rangeText: text,
+            itemListRowIdPrefix: this.buildAutocompleteListRowIdPrefix(),
+          }
         }
       }
     }
@@ -480,16 +797,34 @@ export abstract class AutocompletingTextInput<
     return null
   }
 
+  private buildAutocompleteListRowIdPrefix() {
+    return new Date().getTime().toString()
+  }
+
+  private onScroll = () => {
+    this.updateCaretCoordinates()
+  }
+
   private onChange = async (event: React.FormEvent<ElementType>) => {
+    if (this.props.readOnly === true) {
+      return
+    }
+
     const str = event.currentTarget.value
 
     if (this.props.onValueChanged) {
       this.props.onValueChanged(str)
     }
 
+    this.updateCaretCoordinates()
+
+    return this.open(str)
+  }
+
+  private async open(str: string) {
     const element = this.element
 
-    if (element === null) {
+    if (element === null || this.props.readOnly === true) {
       return
     }
 
@@ -507,7 +842,11 @@ export abstract class AutocompletingTextInput<
 
     // If another autocompletion request is in flight, then ignore these
     // results.
-    if (requestID !== this.autocompletionRequestID) {
+    if (
+      requestID !== this.autocompletionRequestID ||
+      this.props.readOnly ||
+      this.element === null
+    ) {
       return
     }
 

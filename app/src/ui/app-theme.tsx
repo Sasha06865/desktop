@@ -4,6 +4,7 @@ import {
   getThemeName,
   getCurrentlyAppliedTheme,
 } from './lib/application-theme'
+import * as ipcRenderer from '../lib/ipc-renderer'
 
 interface IAppThemeProps {
   readonly theme: ApplicationTheme
@@ -34,29 +35,46 @@ export class AppTheme extends React.PureComponent<IAppThemeProps> {
     this.clearThemes()
   }
 
-  private ensureTheme() {
+  private async ensureTheme() {
     let themeToDisplay = this.props.theme
 
     if (this.props.theme === ApplicationTheme.System) {
-      themeToDisplay = getCurrentlyAppliedTheme()
+      themeToDisplay = await getCurrentlyAppliedTheme()
     }
 
     const newThemeClassName = `theme-${getThemeName(themeToDisplay)}`
-    const body = document.body
 
-    if (body.classList.contains(newThemeClassName)) {
-      return
+    if (!document.body.classList.contains(newThemeClassName)) {
+      this.clearThemes()
+      document.body.classList.add(newThemeClassName)
+      this.updateColorScheme()
     }
+  }
 
-    this.clearThemes()
+  private updateColorScheme = () => {
+    const isDarkTheme = document.body.classList.contains('theme-dark')
+    const rootStyle = document.documentElement.style
 
-    body.classList.add(newThemeClassName)
+    rootStyle.colorScheme = isDarkTheme ? 'dark' : 'light'
+
+    // Update the window's background color to match the CSS value
+    const backgroundColor = getComputedStyle(document.body).getPropertyValue(
+      '--background-color'
+    )
+    if (backgroundColor) {
+      ipcRenderer.send('update-window-background-color', backgroundColor.trim())
+    }
   }
 
   private clearThemes() {
     const body = document.body
 
-    for (const className of body.classList) {
+    // body.classList is a DOMTokenList and it does not iterate all the way
+    // through with the for loop. (why it doesn't.. ¯\_(ツ)_/¯ - Possibly
+    // because we are modifying it as we loop) Hence the extra step of
+    // converting it to a string array.
+    const classList = [...body.classList]
+    for (const className of classList) {
       if (className.startsWith('theme-')) {
         body.classList.remove(className)
       }

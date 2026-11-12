@@ -3,6 +3,7 @@ import { WorkingDirectoryStatus } from '../../src/models/status'
 import { merge } from '../../src/lib/merge'
 import { IStatusResult } from '../../src/lib/git'
 import { DefaultCommitMessage } from '../../src/models/commit-message'
+import { RepoRulesInfo } from '../../src/models/repo-rules'
 
 export function createState<K extends keyof IChangesState>(
   pick: Pick<IChangesState, K>
@@ -15,11 +16,24 @@ export function createState<K extends keyof IChangesState>(
       diff: null,
     },
     commitMessage: DefaultCommitMessage,
+    commitMode: 'manual',
+    pushAfterCommit: false,
+    assistedCommit: { kind: 'idle' },
+    assistedCommitAvailable: false,
     showCoAuthoredBy: false,
     coAuthors: [],
     conflictState: null,
     stashEntry: null,
     currentBranchProtected: false,
+    currentRepoRulesInfo: new RepoRulesInfo(),
+    fileListFilter: {
+      filterText: '',
+      isIncludedInCommit: false,
+      isNewFile: false,
+      isModifiedFile: false,
+      isDeletedFile: false,
+      isExcludedFromCommit: false,
+    },
   }
 
   return merge(baseChangesState, pick)
@@ -31,9 +45,11 @@ export function createStatus<K extends keyof IStatusResult>(
   const baseStatus: IStatusResult = {
     exists: true,
     mergeHeadFound: false,
+    squashMsgFound: false,
     rebaseInternalState: null,
     isCherryPickingHeadFound: false,
     workingDirectory: WorkingDirectoryStatus.fromFiles([]),
+    doConflictedFilesExist: false,
   }
 
   return merge(baseStatus, pick)

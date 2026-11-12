@@ -8,12 +8,22 @@
   }
 }
 
-.clone-github-repo {
-  height: 250px;
+dialog.clone-repository {
+  .clone-github-repo {
+    height: calc(100vh - 400px);
+    max-height: 250px;
+  }
+}
 
-  &.filter-list .filter-field-row {
-    margin: var(--spacing-double);
-    margin-bottom: var(--spacing);
+.clone-github-repo {
+  &.filter-list {
+    max-width: 100%;
+
+    .filter-field-row {
+      margin: var(--spacing-double);
+      margin-bottom: var(--spacing);
+      margin-top: 0;
+    }
   }
 
   .clone-repository-list {
@@ -50,18 +60,49 @@
 .dialog-content {
   &.clone-github-repository-content {
     padding: 0;
+    padding-top: var(--spacing-double);
+
+    .account-picker-row {
+      margin: 0 var(--spacing-double);
+      padding-bottom: var(--spacing);
+
+      .popover-dropdown-component {
+        width: 100%;
+      }
+    }
   }
 
   &.clone-generic-repository-content {
     padding: var(--spacing-double);
+
+    .clone-url-textbox-label p {
+      margin: 0;
+    }
   }
 }
 
 .clone-repository {
   width: 500px;
 
+  .select-component.accounts {
+    padding: 0 var(--spacing-double);
+    margin-bottom: var(--spacing);
+  }
+
+  .sign-in-enterprise {
+    justify-content: center;
+    margin-top: var(--spacing);
+    font-size: var(--font-size-sm);
+  }
+
   .local-path-field {
     border-top: var(--base-border);
     padding: var(--spacing-double);
+  }
+
+  .dialog-content {
+    > .row-component:not(:last-child) {
+      margin-bottom: 0;
+    }
   }
 }
